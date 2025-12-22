@@ -47,24 +47,27 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("资金盘推演")
-st.caption("Binance 独立全仓模拟 | 动态资金调动推演")
+st.caption("Binance 独立全仓模拟 | 实时价格来自 CoinGecko API")
 
 # ==========================================
-# 0.5 Binance API 集成
+# 0.5 CoinGecko API 集成（无地理限制）
 # ==========================================
 
-@st.cache_data(ttl=30)  # 缓存 10 秒
-def get_binance_btc_price():
-    """从 Binance API 获取 BTC/USDT 实时价格"""
+@st.cache_data(ttl=30)  # 缓存 30 秒
+def get_btc_price():
+    """从 CoinGecko API 获取 BTC/USDT 实时价格（无地理限制）"""
     try:
-        url = "https://api.binance.com/api/v3/ticker/price"
-        params = {"symbol": "BTCUSDT"}
+        url = "https://api.coingecko.com/api/v3/simple/price"
+        params = {
+            "ids": "bitcoin",
+            "vs_currencies": "usd"
+        }
         response = requests.get(url, params=params, timeout=5)
         response.raise_for_status()
         data = response.json()
-        return float(data['price'])
+        return float(data['bitcoin']['usd'])
     except Exception as e:
-        st.error(f"⚠️ 无法获取 Binance 价格: {str(e)}")
+        st.error(f"⚠️ 无法获取 BTC 价格: {str(e)}")
         return None
 
 # ==========================================
@@ -76,7 +79,7 @@ if 'last_valid_price' not in st.session_state:
     st.session_state.last_valid_price = None
 
 # 获取实时价格（每30秒自动刷新）
-live_price = get_binance_btc_price()
+live_price = get_btc_price()
 
 if live_price and live_price > 0:
     # 成功获取有效价格
@@ -87,8 +90,8 @@ elif st.session_state.last_valid_price:
     current_price = st.session_state.last_valid_price
 else:
     # 完全没有历史数据，使用合理的默认值
-    current_price = 97200.0  # 备用默认值（避免除零错误）
-    st.warning("⚠️ 暂时无法获取实时价格，使用默认值 $97,200")
+    current_price = 90000.0  # 备用默认值（避免除零错误）
+    st.warning("⚠️ 暂时无法获取实时价格，使用默认值 $90,000")
 
 # 这些将在 Portfolio Overview 中作为可编辑字段显示
 # 暂时用默认值初始化
