@@ -86,8 +86,9 @@ elif st.session_state.last_valid_price:
     # API 失败或返回 0，使用上次保存的有效价格
     current_price = st.session_state.last_valid_price
 else:
-    # 完全没有历史数据，使用默认值
-    current_price = 0.0  # 备用默认值
+    # 完全没有历史数据，使用合理的默认值
+    current_price = 97200.0  # 备用默认值（避免除零错误）
+    st.warning("⚠️ 暂时无法获取实时价格，使用默认值 $97,200")
 
 # 这些将在 Portfolio Overview 中作为可编辑字段显示
 # 暂时用默认值初始化
@@ -173,7 +174,7 @@ def calc_liq_price(equity, l_q, l_e, s_q, s_e, mm, curr_p):
 
 # 当前状态计算
 current_liq = calc_liq_price(binance_equity, long_qty, long_entry, short_qty, short_entry, mm_rate, current_price)
-current_buffer = (current_price - current_liq) / current_price * 100
+current_buffer = (current_price - current_liq) / current_price * 100 if current_price > 0 else 0
 
 # ==========================================
 # 2.5 操作序列计算引擎
