@@ -5,49 +5,26 @@ import numpy as np
 import requests
 from datetime import datetime
 
+# 导入模块化UI组件
+from ui_styles import CSS_STYLES
+from ui_components import render_header
+
 # ==========================================
-# 0. 页面配置 (复刻 NanoBanana 风格)
+# 0. 页面配置
 # ==========================================
 
-st.set_page_config(page_title="Capital Commander", layout="wide", page_icon="🍌")
+st.set_page_config(
+    page_title="Trading Simulation | 资金盘推演", 
+    layout="wide", 
+    page_icon="📊",
+    initial_sidebar_state="collapsed"
+)
 
-# 强制亮色模式CSS (Light Mode)
-# 移除 .stApp background-color: #0e1117, 改为默认白色 (Streamlit default is white in light mode, but we force it)
-# 加上 borders 样式优化
-st.markdown("""
-<style>
-    /* 全局背景设为白色 */
-    .stApp { background-color: #ffffff; color: #333333; }
-    
-    /* 减小全局字体 */
-    html, body, [class*="css"] {
-        font-size: 13px;
-    }
-    
-    /* 标题字体缩小 */
-    h1 { font-size: 1.8rem !important; color: #1a1a1a !important; }
-    h2 { font-size: 1.3rem !important; color: #1a1a1a !important; }
-    h3 { font-size: 1.1rem !important; color: #1a1a1a !important; }
-    h4 { font-size: 0.95rem !important; color: #1a1a1a !important; }
-    
-    /* Metric 样式：浅灰背景，深灰边框，紧凑 */
-    .stMetric { 
-        background-color: #f8f9fa; 
-        border: 1px solid #dee2e6; 
-        padding: 8px; 
-        border-radius: 6px; 
-    }
-    .stMetric label { font-size: 0.75rem !important; }
-    .stMetric [data-testid="stMetricValue"] { font-size: 1.2rem !important; }
-    
-    /* 关键高亮 */
-    .highlight { color: #00c853; font-weight: bold; }
-    .danger { color: #ff2b2b; font-weight: bold; }
-</style>
-""", unsafe_allow_html=True)
+# 应用样式
+st.markdown(CSS_STYLES, unsafe_allow_html=True)
 
-st.title("资金盘推演")
-st.caption("Binance 独立全仓模拟 | 实时价格来自 CoinGecko API")
+# 渲染头部
+render_header()
 
 # ==========================================
 # 0.5 CoinGecko API 集成（无地理限制）
@@ -604,8 +581,11 @@ with row2_col2.container(border=True):
     
     with col_adjusted:
         st.markdown(f"**情景 B: {strategy_label}**")
+        # 始终显示info框以保持和情景A对齐
         if len(st.session_state.operations) > 0:
             st.info(f"⚙️ 考虑第2板块的 {len(st.session_state.operations)} 个操作")
+        else:
+            st.info("💡 未设置操作序列，结果与情景A相同")
         st.metric("最终权益", f"${adjusted_equity_final:,.0f}")
         total_pnl_adjusted = adjusted_equity_final - binance_equity
         st.metric("总盈亏", f"${total_pnl_adjusted:,.0f}", 
