@@ -1049,115 +1049,132 @@ with st.container(border=True):
         pnl = (p - current_price) * (long_qty - short_qty)
         pnl_hold_curve.append(pnl)  # 只显示盈亏，不加初始权益
     
-    # 2. 计算 Adjusted 曲线 - 分段计算以清晰展示斜率变化
+    # 2. 计算 Adjusted 曲线 - 使用分段计算清晰展示斜率变化（勾状）
     pnl_adjusted_curve = []
+    x_adjusted_prices = []  # 用于存储包含操作点的完整价格序列
     
     # 获取排序后的操作列表
     sorted_ops = sorted(st.session_state.operations, key=lambda x: x['price'])
     
-    # 预计算所有点的 PnL
-    for p in x_prices:
-        # 找出在当前价和这个价格p之间已经触发的操作
-        triggered_ops = []
-        if p >= current_price:
-            triggered_ops = [op for op in sorted_ops if current_price < op['price'] <= p]
-        else:
-            # 价格下跌的情况（暂时不处理，因为大部分场景是上涨）
-            pnl_adjusted_curve.append((p - current_price) * (long_qty - short_qty))
-            continue
-        
-        if len(triggered_ops) == 0:
-            # 还没触发任何操作，跟Hold一样
-            pnl = (p - current_price) * (long_qty - short_qty)
-            pnl_adjusted_curve.append(pnl)
-        else:
-            # 执行操作序列
-            # 初始状态
-            sim_price = current_price
-            sim_qty = long_qty
-            sim_entry = long_entry
-            sim_binance_equity = st.session_state.binance_equity
+    # 构建关键价格点列表（当前价 → 操作点们 → 目标价）
+    key_prices = [current_price]
+    for op in sorted_ops:
+        if current_price < op['price'] <= x_max:
+            key_prices.append(op['price'])
+    key_prices.append(x_max)
+    key_prices = sorted(set(key_prices))  # 去重并排序
+    
+    # 在每两个关键点之间生成密集的价格点
+    for i in range(len(key_prices) - 1):
+        start_p = key_prices[i]
+        end_p = key_prices[i + 1]
+        # 在这个区间生成20个点
+        segment_prices = np.linspace(start_p, end_p, 20, endpoint=False)
+        x_adjusted_prices.extend(segment_prices)
+    
+    # 添加最后一个点
+    x_adjusted_prices.append(key_prices[-1])
+    x_adjusted_prices = np.array(x_adjusted_prices)
+    
+    # 计算每个价格点的PnL
+    sim_price = current_price
+    sim_qty = long_qty
+    sim_entry = long_entry
+    sim_binance_equity = st.session_state.binance_equity
+    
+    op_index = 0  # 当前要触发的操作索引
+    
+    for p in x_adjusted_prices:
+        # 检查当前价格p之前是否有需要触发的操作
+        while op_index < len(sorted_ops) and sorted_ops[op_index]['price'] <= p:
+            op = sorted_ops[op_index]
             
-            # 逐个执行触发的操作
-            for op in triggered_ops:
-                # 1. 价格变动到操作价
-                price_move_pnl = (op['price'] - sim_price) * (sim_qty - short_qty)
-                sim_binance_equity += price_move_pnl
-                sim_price = op['price']
+            # 1. 价格移动到操作价
+            price_move_pnl = (op['price'] - sim_price) * (sim_qty - short_qty)
+            sim_binance_equity += price_move_pnl
+            sim_price = op['price']
+            
+            # 2. 执行操作
+            if op['action'] == '卖出':
+                if op['amount_type'] == '百分比':
+                    sell_qty = sim_qty * (op['amount'] / 100)
+                else:
+                    sell_qty = min(op['amount'] / op['price'], sim_qty)
                 
-                # 2. 执行操作
-                if op['action'] == '卖出':
-                    if op['amount_type'] == '百分比':
-                        sell_qty = sim_qty * (op['amount'] / 100)
-                    else:
-                        sell_qty = min(op['amount'] / op['price'], sim_qty)
-                    
-                    realized_pnl = (op['price'] - sim_entry) * sell_qty
-                    sim_binance_equity += realized_pnl
-                    sim_qty -= sell_qty
-                    
-                else:  # 买入
-                    if op['amount_type'] == '百分比':
-                        buy_value = (sim_qty * op['price']) * (op['amount'] / 100)
-                        buy_qty = buy_value / op['price']
-                    else:
-                        buy_qty = op['amount'] / op['price']
-                    
-                    total_cost = sim_qty * sim_entry + buy_qty * op['price']
-                    sim_qty += buy_qty
-                    sim_entry = total_cost / sim_qty if sim_qty > 0 else op['price']
+                realized_pnl = (op['price'] - sim_entry) * sell_qty
+                sim_binance_equity += realized_pnl
+                sim_qty -= sell_qty
+                
+            else:  # 买入
+                if op['amount_type'] == '百分比':
+                    buy_value = (sim_qty * op['price']) * (op['amount'] / 100)
+                    buy_qty = buy_value / op['price']
+                else:
+                    buy_qty = op['amount'] / op['price']
+                
+                total_cost = sim_qty * sim_entry + buy_qty * op['price']
+                sim_qty += buy_qty
+                sim_entry = total_cost / sim_qty if sim_qty > 0 else op['price']
             
-            # 3. 从最后一个操作价到目标价格p
-            final_move_pnl = (p - sim_price) * (sim_qty - short_qty)
-            sim_binance_equity += final_move_pnl
-            
-            # 转换为盈亏
-            pnl_adjusted_curve.append(sim_binance_equity - st.session_state.binance_equity)
+            op_index += 1
+        
+        # 3. 从最后操作价（或当前价）到这个价格p的PnL
+        final_move_pnl = (p - sim_price) * (sim_qty - short_qty)
+        total_equity = sim_binance_equity + final_move_pnl
+        
+        # 保存PnL（相对于初始权益）
+        pnl_adjusted_curve.append(total_equity - st.session_state.binance_equity)
 
     # 绘制图表
     fig = go.Figure()
     
     # 先添加填充区域（收益差异可视化）
     fig.add_trace(go.Scatter(
-        x=x_prices, 
+        x=x_adjusted_prices, 
         y=pnl_adjusted_curve,
         mode='lines',
         line=dict(width=0),
         showlegend=False,
         hoverinfo='skip',
-        name='调仓策略上界'
+        fillcolor='rgba(0,255,0,0.1)'
     ))
     
     fig.add_trace(go.Scatter(
-        x=x_prices, 
+        x=x_prices,
         y=pnl_hold_curve,
+        fill='tonexty',
         mode='lines',
         line=dict(width=0),
-        fillcolor='rgba(0, 200, 83, 0.1)',  # 绿色半透明填充
-        fill='tonexty',  # 填充到上一条线
         showlegend=False,
         hoverinfo='skip',
         name='Hold基准下界'
     ))
     
-    # Hold 线 - 灰色虚线
+    # Hold曲线（蓝色虚线）- 始终是直线，斜率恒定
     fig.add_trace(go.Scatter(
         x=x_prices, 
-        y=pnl_hold_curve, 
-        mode='lines', 
+        y=pnl_hold_curve,
+        mode='lines',
         name='Hold (死扛)',
-        line=dict(color='#999999', dash='dash', width=3),
-        hovertemplate='<b>Hold</b><br>价格: $%{x:,.0f}<br>盈亏: $%{y:,.0f}<extra></extra>'
+        line=dict(
+            color='rgba(31, 119, 180, 0.8)',  # 蓝色
+            width=3,
+            dash='dash'
+        ),
+        hovertemplate='<b>Hold策略</b><br>BTC价格: $%{x:,.0f}<br>PnL: $%{y:,.0f}<extra></extra>'
     ))
     
-    # Adjusted 线 - 绿色实线，更粗
+    # Adjusted曲线（绿色实线）- 在操作点显示斜率变化（勾状）
     fig.add_trace(go.Scatter(
-        x=x_prices, 
-        y=pnl_adjusted_curve, 
-        mode='lines', 
-        name='Adjusted (调仓策略)',
-        line=dict(color='#00c853', width=4),
-        hovertemplate='<b>调仓策略</b><br>价格: $%{x:,.0f}<br>盈亏: $%{y:,.0f}<extra></extra>'
+        x=x_adjusted_prices,  # 使用包含操作点的密集价格序列
+        y=pnl_adjusted_curve,
+        mode='lines',
+        name=f'操作序列 ({len(st.session_state.operations)}步)',
+        line=dict(
+            color='rgba(0, 200, 83, 1)',  # 绿色
+            width=3
+        ),
+        hovertemplate='<b>操作策略</b><br>BTC价格: $%{x:,.0f}<br>PnL: $%{y:,.0f}<extra></extra>'
     ))
     
     # 标记点：当前价（起点，PnL = 0）
