@@ -9,6 +9,9 @@ from datetime import datetime
 from ui_styles import CSS_STYLES
 from ui_components import render_header
 
+# 导入资金划转引擎
+import transfer_engine as te
+
 # ==========================================
 # 0. 页面配置
 # ==========================================
@@ -19,6 +22,31 @@ st.set_page_config(
     page_icon="📊",
     initial_sidebar_state="collapsed"
 )
+
+# ==================== 保持滚动位置 ====================
+# 在按钮点击前保存滚动位置
+import streamlit.components.v1 as components
+
+def preserve_scroll_position():
+    """保存当前滚动位置并在重新加载后恢复"""
+    components.html("""
+        <script>
+        // 保存当前滚动位置
+        const scrollY = window.parent.document.documentElement.scrollTop || window.parent.document.body.scrollTop;
+        window.parent.sessionStorage.setItem('streamlit_scroll', scrollY);
+        
+        // 尝试恢复滚动位置（页面加载后）
+        setTimeout(function() {
+            const savedScroll = window.parent.sessionStorage.getItem('streamlit_scroll');
+            if (savedScroll !== null) {
+                window.parent.scrollTo(0, parseInt(savedScroll));
+            }
+        }, 100);
+        </script>
+    """, height=0)
+
+# 在每次页面加载时尝试恢复滚动位置
+preserve_scroll_position()
 
 # 应用样式
 st.markdown(CSS_STYLES, unsafe_allow_html=True)
@@ -71,9 +99,10 @@ else:
     st.warning("⚠️ 暂时无法获取实时价格，使用默认值 $90,000")
 
 # 这些将在 Portfolio Overview 中作为可编辑字段显示
-# 暂时用默认值初始化
-luno_spot_value = 1_000_000.0
-binance_equity = 2_000_000.0
+# ⚠️ 重要：不再创建局部变量，直接使用 session state
+# 这样确保所有地方（包括划转、操作序列等）都使用同一份数据源
+# luno_spot_value 和 binance_equity 将直接从 st.session_state 读取
+
 long_size_usdt = 2_500_000.0
 long_entry = 100000.0
 short_size_usdt = 0.0
@@ -106,6 +135,17 @@ if 'new_op_percent' not in st.session_state:
 # 目标价格 session state（保持用户设置不被刷新重置）
 if 'target_price' not in st.session_state:
     st.session_state.target_price = 100000.0
+
+# 资金划转 session state
+if 'transfer_history' not in st.session_state:
+    st.session_state.transfer_history = []
+
+# 账户余额 session state（持久化存储，避免刷新重置）
+if 'luno_spot_value' not in st.session_state:
+    st.session_state.luno_spot_value = 1_000_000.0
+
+if 'binance_equity' not in st.session_state:
+    st.session_state.binance_equity = 2_000_000.0
 
 # 计算持仓数量
 long_qty = long_size_usdt / long_entry if long_entry else 0
@@ -153,7 +193,7 @@ def calc_liq_price(equity, l_q, l_e, s_q, s_e, mm, curr_p):
     return max(0.0, liq_price)
 
 # 当前状态计算
-current_liq = calc_liq_price(binance_equity, long_qty, long_entry, short_qty, short_entry, mm_rate, current_price)
+current_liq = calc_liq_price(st.session_state.binance_equity, long_qty, long_entry, short_qty, short_entry, mm_rate, current_price)
 current_buffer = (current_price - current_liq) / current_price * 100 if current_price > 0 else 0
 
 # ==========================================
@@ -245,8 +285,24 @@ with st.container(border=True):
         with col_edit1:
             st.subheader("市场与持仓")
             current_price = st.number_input("BTC 当前价格", value=current_price, step=100.0, key="edit_price")
-            luno_spot_value = st.number_input("Luno 现货价值", value=luno_spot_value, step=10000.0, key="edit_luno")
-            binance_equity = st.number_input("Binance 权益", value=binance_equity, step=10000.0, key="edit_equity")
+            
+            # 直接使用 session state 值，确保持久化
+            luno_spot_value = st.number_input(
+                "Luno 现货价值", 
+                value=st.session_state.luno_spot_value, 
+                step=10000.0, 
+                key="edit_luno"
+            )
+            binance_equity = st.number_input(
+                "Binance 权益", 
+                value=st.session_state.binance_equity, 
+                step=10000.0, 
+                key="edit_equity"
+            )
+            
+            # 立即同步到 session state
+            st.session_state.luno_spot_value = luno_spot_value
+            st.session_state.binance_equity = binance_equity
         
         with col_edit2:
             st.subheader("合约持仓")
@@ -256,19 +312,27 @@ with st.container(border=True):
             if short_size_usdt > 0:
                 short_entry = st.number_input("做空均价", value=short_entry, step=100.0, key="edit_short_entry")
         
+        # 同步到 session state（当用户手动编辑时）
+        st.session_state.luno_spot_value = luno_spot_value
+        st.session_state.binance_equity = binance_equity
+        
         # 重新计算持仓数量
         long_qty = long_size_usdt / long_entry if long_entry else 0
         short_qty = short_size_usdt / short_entry if (short_entry and short_size_usdt > 0) else 0
     
+    # ⚠️ 重要：从 session state 重新获取最新值，确保后续计算使用最新的余额
+    # （这样在数据编辑或资金划转后，操作序列和目标价推演都会使用最新值）
+    # 注意：直接使用 st.session_state，不创建局部变量
+    
     # 计算总资产组合
-    luno_btc_qty = luno_spot_value / current_price if current_price > 0 else 0
-    total_portfolio = binance_equity + luno_spot_value
+    luno_btc_qty = st.session_state.luno_spot_value / current_price if current_price > 0 else 0
+    total_portfolio = st.session_state.binance_equity + st.session_state.luno_spot_value
     
     # Row 1: 总资产
     st.markdown("#### 总资产组合")
     p1, p2 = st.columns(2)
     p1.metric("总资产", f"${total_portfolio:,.0f}", help="Binance + Luno 总资产")
-    total_position_value = (long_qty - short_qty) * current_price + luno_spot_value
+    total_position_value = (long_qty - short_qty) * current_price + st.session_state.luno_spot_value
     p2.metric("总持仓价值", f"${total_position_value:,.0f}", 
               help="全部持仓价值（含现货和合约净头寸）")
     
@@ -285,8 +349,8 @@ with st.container(border=True):
     # Row 3: Luno 现货
     st.markdown("#### Luno 现货")
     l1, l2 = st.columns(2)
-    l1.metric("现货价值", f"${luno_spot_value:,.0f}", help="现货资产价值")
-    l2.metric("现货持仓", f"${luno_spot_value:,.0f}", help="现货持仓价值")
+    l1.metric("现货价值", f"${st.session_state.luno_spot_value:,.0f}", help="现货资产价值")
+    l2.metric("现货持仓", f"${st.session_state.luno_spot_value:,.0f}", help="现货持仓价值")
     
     st.markdown("---")
     
@@ -306,6 +370,204 @@ with st.container(border=True):
         </div>
     """, unsafe_allow_html=True)
 
+# ==========================================
+# Row 1.5: Fund Transfer Panel
+# ==========================================
+with st.container(border=True):
+    st.header("💸 资金划转")
+
+    # 显示可用余额
+    col_bal1, col_bal2, col_bal3 = st.columns(3)
+    col_bal1.metric("Luno 现货", f"${st.session_state.luno_spot_value:,.0f}")
+    col_bal2.metric("Binance 权益", f"${st.session_state.binance_equity:,.0f}")
+    col_bal3.metric("总资产", f"${st.session_state.luno_spot_value + st.session_state.binance_equity:,.0f}")
+
+    st.markdown("---")
+
+    # 划转控制面板
+    transfer_col1, transfer_col2 = st.columns([1, 1])
+    
+    with transfer_col1:
+        st.markdown("#### 划转设置")
+        
+        # 划转方向
+        direction = st.radio(
+            "划转方向",
+            options=["Luno → Binance", "Binance → Luno"],
+            key="transfer_direction",
+            horizontal=True
+        )
+        
+        direction_key = 'luno_to_binance' if direction == "Luno → Binance" else 'binance_to_luno'
+        
+        # 计算可用余额 - 使用 session state 值
+        max_available = te.calculate_available_to_transfer(
+            direction_key, 
+            st.session_state.luno_spot_value,  # 使用 session state
+            st.session_state.binance_equity,    # 使用 session state
+            long_qty, long_entry, short_qty, short_entry,
+            mm_rate, current_price
+        )
+        
+        # 划转金额输入
+        transfer_amount = st.number_input(
+            "划转金额 (USDT)",
+            min_value=0.0,
+            max_value=max_available,
+            value=min(100000.0, max_available),
+            step=10000.0,
+            key="transfer_amount_input",
+            help=f"最大可划转: ${max_available:,.0f}"
+        )
+        
+        st.caption(f"💡 安全可划转上限: ${max_available:,.0f}")
+    
+    with transfer_col2:
+        st.markdown("#### 影响预览")
+        
+        # 验证划转 - 使用 session state 值
+        is_valid, error_msg, warning_msg = te.validate_transfer(
+            direction_key, transfer_amount, 
+            st.session_state.luno_spot_value,  # 使用 session state
+            st.session_state.binance_equity,    # 使用 session state
+            long_qty, long_entry, short_qty, short_entry, mm_rate, current_price,
+            calc_liq_price_func=calc_liq_price
+        )
+        
+        if transfer_amount > 0:
+            # 计算划转影响 - 使用 session state 值
+            impact = te.calculate_transfer_impact(
+                direction_key, transfer_amount, 
+                st.session_state.luno_spot_value,  # 使用 session state
+                st.session_state.binance_equity,    # 使用 session state
+                long_qty, long_entry, short_qty, short_entry, mm_rate, current_price,
+                calc_liq_price_func=calc_liq_price
+            )
+            
+            # 显示划转后的状态
+            st.markdown("**划转后账户余额:**")
+            after_col1, after_col2 = st.columns(2)
+            
+            luno_delta = impact['luno_change']
+            binance_delta = impact['binance_change']
+            
+            after_col1.metric(
+                "Luno", 
+                f"${impact['luno_after']:,.0f}",
+                delta=f"{luno_delta:+,.0f}"
+            )
+            after_col2.metric(
+                "Binance", 
+                f"${impact['binance_after']:,.0f}",
+                delta=f"{binance_delta:+,.0f}"
+            )
+            
+            st.markdown("**风险指标变化:**")
+            risk_col1, risk_col2 = st.columns(2)
+            
+            liq_delta = impact['liq_price_change']
+            liq_delta_color = "inverse" if liq_delta > 0 else "normal"
+            
+            risk_col1.metric(
+                "强平价",
+                f"${impact['liq_price_after']:,.0f}",
+                delta=f"{liq_delta:+,.0f}",
+                delta_color=liq_delta_color
+            )
+            
+            buffer_delta = impact['buffer_change']
+            buffer_delta_color = "normal" if buffer_delta > 0 else "inverse"
+            
+            risk_col2.metric(
+                "风险缓冲",
+                f"{impact['buffer_after']:.1f}%",
+                delta=f"{buffer_delta:+.1f}%",
+                delta_color=buffer_delta_color
+            )
+            
+            # 显示警告或错误
+            if error_msg:
+                st.error(f"❌ {error_msg}")
+            elif warning_msg:
+                st.warning(warning_msg)
+            else:
+                st.success("✅ 划转安全，可以执行")
+        else:
+            st.info("请输入划转金额查看影响预览")
+    
+    st.markdown("---")
+    
+    # 执行按钮
+    button_col1, button_col2, button_col3 = st.columns([1, 1, 1])
+    
+    with button_col2:
+        execute_disabled = not is_valid or transfer_amount <= 0
+        
+        if st.button(
+            "🚀 执行划转",
+            type="primary",
+            use_container_width=True,
+            disabled=execute_disabled,
+            help="确认执行资金划转" if not execute_disabled else error_msg
+        ):
+            # 执行划转 - 使用 session state 的最新值而不是局部变量
+            new_luno, new_binance = te.execute_transfer(
+                direction_key, transfer_amount, 
+                st.session_state.luno_spot_value,  # 使用 session state 值
+                st.session_state.binance_equity     # 使用 session state 值
+            )
+            
+            # 更新 session state
+            st.session_state.luno_spot_value = new_luno
+            st.session_state.binance_equity = new_binance
+            
+            # 记录历史
+            transfer_record = {
+                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'direction': direction,
+                'amount': transfer_amount,
+                'luno_after': new_luno,
+                'binance_after': new_binance
+            }
+            st.session_state.transfer_history.append(transfer_record)
+            
+            st.success(f"✅ 划转成功！已将 ${transfer_amount:,.0f} 从 {direction}")
+            st.rerun()
+    
+    # 划转历史
+    if len(st.session_state.transfer_history) > 0:
+        st.markdown("---")
+        st.markdown("#### 📜 划转历史")
+        
+        # 创建历史记录表格
+        history_df = pd.DataFrame(st.session_state.transfer_history)
+        
+        # 格式化显示
+        display_df = history_df.copy()
+        display_df['金额'] = display_df['amount'].apply(lambda x: f"${x:,.0f}")
+        display_df['时间'] = display_df['timestamp']
+        display_df['方向'] = display_df['direction']
+        
+        # 只显示最近5条
+        recent_history = display_df[['时间', '方向', '金额']].tail(5).iloc[::-1]
+        
+        st.dataframe(
+            recent_history,
+            use_container_width=True,
+            hide_index=True
+        )
+        
+        # 清空历史按钮
+        if st.button("🗑️ 清空历史记录"):
+            st.session_state.transfer_history = []
+            st.rerun()
+
+# ⚠️ 关键：从 session state 获取值用于后续计算
+# 不创建局部变量，确保所有地方使用同一数据源
+# 同时重新计算当前强平价和风险缓冲（基于最新资金量）
+current_liq = calc_liq_price(st.session_state.binance_equity, long_qty, long_entry, short_qty, short_entry, mm_rate, current_price)
+current_buffer = (current_price - current_liq) / current_price * 100 if current_price > 0 else 0
+
 # Row 2: Operation Sequencer (左) + Target Price Calculator (右)
 row2_col1, row2_col2 = st.columns(2)
 
@@ -314,45 +576,107 @@ row2_col1, row2_col2 = st.columns(2)
 with row2_col1.container(border=True):
     st.header("2. 操作序列")
     
-    # 添加新操作
-    st.markdown("#### ➕ 添加新操作")
+    # 创建 Binance 和 Luno 两个标签页
+    tab1, tab2 = st.tabs(["🔶 Binance 合约 (10x)", "🟦 Luno 现货"])
     
-    col1, col2, col3 = st.columns([2, 2, 1])
+    # === Binance Tab ===
+    with tab1:
+        
+        # 显示可用资金
+        available_binance = binance_equity
+        st.caption(f"💰 当前 Binance 权益：${available_binance:,.0f} | 最大可开仓位：${available_binance * 10:,.0f}")
+        
+        st.markdown("#### ➕ 添加 Binance 合约操作")
+        
+        col1, col2, col3 = st.columns([2, 2, 1])
+        
+        with col1:
+            binance_price = st.number_input("触发价格", value=st.session_state.new_op_price, step=100.0, key="binance_input_price")
+        
+        with col2:
+            binance_action = st.selectbox("动作", ["买入", "卖出"], key="binance_input_action")
+        
+        # 金额输入 - 优先使用 USDT 金额
+        binance_amount_mode = st.radio("金额方式", ["USDT金额", "百分比"], horizontal=True, key="binance_input_amount_mode")
+        
+        if binance_amount_mode == "USDT金额":
+            # 计算最大可开仓位（权益 * 10）
+            max_position = available_binance * 10
+            binance_amount_usdt = st.number_input("仓位金额 (USDT)", 
+                                                   min_value=0.0,
+                                                   max_value=max_position,
+                                                   value=min(1000000.0, max_position), 
+                                                   step=100000.0, 
+                                                   key="binance_input_amount",
+                                                   help=f"输入目标仓位金额，系统自动计算所需保证金（仓位÷10）\n最大可开：${max_position:,.0f}")
+            binance_amount = binance_amount_usdt
+        else:
+            binance_percent = st.slider("百分比 (%)", 0.0, 100.0, 10.0, 1.0, key="binance_input_percent")
+            binance_amount = binance_percent
+        
+        with col3:
+            st.write("")  # spacing
+            st.write("")  # spacing
+            if st.button("➕ 添加", use_container_width=True, key="binance_add_btn"):
+                new_op = {
+                    'price': binance_price,
+                    'action': binance_action,
+                    'amount_type': binance_amount_mode,
+                    'amount': binance_amount,
+                    'platform': 'binance',
+                    'leverage': 10
+                }
+                st.session_state.operations.append(new_op)
+                st.session_state.new_op_price = binance_price  # 保存输入
+                st.rerun()
     
-    with col1:
-        new_price = st.number_input("触发价格", value=st.session_state.new_op_price, step=100.0, key="input_price")
-        st.session_state.new_op_price = new_price
-    
-    with col2:
-        new_action = st.selectbox("动作", ["买入", "卖出"], index=0 if st.session_state.new_op_action == "买入" else 1, key="input_action")
-        st.session_state.new_op_action = new_action
-    
-    # 金额输入 - 优先使用 USDT 金额
-    amount_mode = st.radio("金额方式", ["USDT金额", "百分比"], horizontal=True, key="input_amount_mode")
-    st.session_state.new_op_amount_type = amount_mode
-    
-    if amount_mode == "USDT金额":
-        new_amount_usdt = st.number_input("金额 (USDT)", value=st.session_state.new_op_amount, step=10000.0, key="input_amount")
-        st.session_state.new_op_amount = new_amount_usdt
-        new_amount = new_amount_usdt
-
-    else:
-        new_percent = st.slider("百分比 (%)", 0.0, 100.0, st.session_state.new_op_percent, 1.0, key="input_percent")
-        st.session_state.new_op_percent = new_percent
-        new_amount = new_percent
-    
-    with col3:
-        st.write("")  # spacing
-        st.write("")  # spacing
-        if st.button("➕ 添加", use_container_width=True):
-            new_op = {
-                'price': new_price,
-                'action': new_action,
-                'amount_type': amount_mode,
-                'amount': new_amount
-            }
-            st.session_state.operations.append(new_op)
-            st.rerun()
+    # === Luno Tab ===
+    with tab2:        
+        # 显示可用资金
+        available_luno = st.session_state.luno_spot_value
+        st.caption(f"💰 当前 Luno 余额：${available_luno:,.0f}")
+        
+        st.markdown("#### ➕ 添加 Luno 现货操作")
+        
+        col1, col2, col3 = st.columns([2, 2, 1])
+        
+        with col1:
+            luno_price = st.number_input("触发价格", value=st.session_state.new_op_price, step=100.0, key="luno_input_price")
+        
+        with col2:
+            luno_action = st.selectbox("动作", ["买入", "卖出"], key="luno_input_action")
+        
+        # 金额输入 - 优先使用 USDT 金额
+        luno_amount_mode = st.radio("金额方式", ["USDT金额", "百分比"], horizontal=True, key="luno_input_amount_mode")
+        
+        if luno_amount_mode == "USDT金额":
+            luno_amount_usdt = st.number_input("现货金额 (USDT)", 
+                                               min_value=0.0,
+                                               max_value=available_luno,
+                                               value=min(100000.0, available_luno), 
+                                               step=10000.0, 
+                                               key="luno_input_amount",
+                                               help=f"输入购买现货的金额\n最大可用：${available_luno:,.0f}")
+            luno_amount = luno_amount_usdt
+        else:
+            luno_percent = st.slider("百分比 (%)", 0.0, 100.0, 10.0, 1.0, key="luno_input_percent")
+            luno_amount = luno_percent
+        
+        with col3:
+            st.write("")  # spacing
+            st.write("")  # spacing
+            if st.button("➕ 添加", use_container_width=True, key="luno_add_btn"):
+                new_op = {
+                    'price': luno_price,
+                    'action': luno_action,
+                    'amount_type': luno_amount_mode,
+                    'amount': luno_amount,
+                    'platform': 'luno',
+                    'leverage': 1
+                }
+                st.session_state.operations.append(new_op)
+                st.session_state.new_op_price = luno_price  # 保存输入
+                st.rerun()
     
     st.markdown("---")
     
@@ -363,7 +687,8 @@ with row2_col1.container(border=True):
         st.info("暂无操作。点击上方「➕ 添加」按钮添加操作。")
     else:
         # 计算整个操作序列的执行结果（用于显示）
-        sim_equity = binance_equity
+        sim_binance_equity = st.session_state.binance_equity
+        sim_luno_value = st.session_state.luno_spot_value
         sim_qty = long_qty
         sim_entry = long_entry
         sim_price = current_price
@@ -371,93 +696,174 @@ with row2_col1.container(border=True):
         # 按价格排序
         sorted_ops = sorted(st.session_state.operations, key=lambda x: x['price'])
         
-        # 表格表头
-        h1, h2, h3, h4, h5, h6, h7 = st.columns([0.8, 1.2, 1.2, 1.4, 1.4, 1.2, 0.5])
+        # 表格表头 - 添加 Luno 和 Binance 余额列
+        h0, h1, h2, h3, h4, h5, h6, h7, h8 = st.columns([0.4, 0.7, 1.0, 1.2, 1.2, 1.2, 1.0, 1.0, 0.4])
+        h0.markdown("**平台**")
         h1.markdown("**操作**")
         h2.markdown("**触发价**")
         h3.markdown("**金额**")
-        h4.markdown("**权益**")
-        h5.markdown("**持仓**")
-        h6.markdown("**强平价**")
-        h7.write("") # 删除按钮列
+        h4.markdown("**Luno余额**")
+        h5.markdown("**Binance余额**")
+        h6.markdown("**持仓**")
+        h7.markdown("**强平价**")
+        h8.write("") # 删除按钮列
         
         st.markdown("---")
         
-        for idx, op in enumerate(sorted_ops):
-            # 模拟执行到这个操作
-            op_price = op['price']
+        # 添加自定义滚动条样式
+        st.markdown("""
+            <style>
+            /* 自定义滚动条样式 */
+            div[data-testid="stVerticalBlock"] > div[style*="overflow"] {
+                scrollbar-width: thin;
+                scrollbar-color: #888 #f1f1f1;
+            }
             
-            # 价格变动的PnL
-            price_delta = op_price - sim_price
-            pnl = price_delta * (sim_qty - short_qty)
-            sim_equity += pnl
-            sim_price = op_price
+            div[data-testid="stVerticalBlock"] > div[style*="overflow"]::-webkit-scrollbar {
+                width: 8px;
+            }
             
-            # --- 执行操作并计算实际金额 ---
-            effective_usdt = 0.0
+            div[data-testid="stVerticalBlock"] > div[style*="overflow"]::-webkit-scrollbar-track {
+                background: #f1f1f1;
+                border-radius: 4px;
+            }
             
-            if op['action'] == "卖出":
-                if op['amount_type'] == "百分比":
-                    sell_qty = sim_qty * (op['amount'] / 100)
-                    effective_usdt = sell_qty * op_price
+            div[data-testid="stVerticalBlock"] > div[style*="overflow"]::-webkit-scrollbar-thumb {
+                background: #888;
+                border-radius: 4px;
+            }
+            
+            div[data-testid="stVerticalBlock"] > div[style*="overflow"]::-webkit-scrollbar-thumb:hover {
+                background: #555;
+            }
+            </style>
+        """, unsafe_allow_html=True)
+        
+        # 使用带高度限制的容器包裹操作列表（Streamlit 原生支持）
+        ops_container = st.container(height=400)
+        
+        with ops_container:
+            for idx, op in enumerate(sorted_ops):
+                # 向后兼容：旧操作没有 platform 字段，默认为 binance
+                platform = op.get('platform', 'binance')
+                leverage = op.get('leverage', 10)
+                # 模拟执行到这个操作
+                op_price = op['price']
+                
+                # 价格变动的PnL (仅对 Binance 合约)
+                if platform == 'binance':
+                    price_delta = op_price - sim_price
+                    pnl = price_delta * (sim_qty - short_qty)
+                    sim_binance_equity += pnl
+                sim_price = op_price
+                
+                # --- 执行操作并计算实际金额 ---
+                effective_usdt = 0.0
+                
+                if platform == 'binance':
+                    # Binance 合约操作 (10x 杠杆)
+                    if op['action'] == "卖出":
+                        if op['amount_type'] == "百分比":
+                            sell_qty = sim_qty * (op['amount'] / 100)
+                            effective_usdt = sell_qty * op_price
+                        else:
+                            sell_qty = op['amount'] / op_price if op_price > 0 else 0
+                            sell_qty = min(sell_qty, sim_qty)
+                            effective_usdt = sell_qty * op_price
+                        
+                        realized_pnl = (op_price - sim_entry) * sell_qty
+                        sim_binance_equity += realized_pnl
+                        sim_qty -= sell_qty
+                    else:  # 买入
+                        if op['amount_type'] == "百分比":
+                            buy_value = (sim_qty * op_price) * (op['amount'] / 100)
+                            buy_qty = buy_value / op_price if op_price > 0 else 0
+                            margin_used = buy_value / 10  # 实际使用的保证金
+                            effective_usdt = buy_value  # 显示仓位价值
+                        else:
+                            # USDT金额现在是仓位金额，不是保证金
+                            position_value = op['amount']
+                            buy_qty = position_value / op_price if op_price > 0 else 0
+                            margin_used = position_value / 10  # 实际使用的保证金
+                            effective_usdt = position_value  # 显示仓位价值
+                        
+                        # 扣除保证金
+                        sim_binance_equity -= margin_used
+                        
+                        total_cost = sim_qty * sim_entry + buy_qty * op_price
+                        sim_qty += buy_qty
+                        sim_entry = total_cost / sim_qty if sim_qty > 0 else op_price
+                
+                elif platform == 'luno':
+                    # Luno 现货操作 (1x, 无杠杆)
+                    if op['action'] == "卖出":
+                        # 卖出现货，获得 USDT
+                        if op['amount_type'] == "百分比":
+                            # 百分比基于当前 Luno 现货价值
+                            sell_value = sim_luno_value * (op['amount'] / 100)
+                            effective_usdt = sell_value
+                        else:
+                            effective_usdt = op['amount']
+                        sim_luno_value += effective_usdt
+                    else:  # 买入
+                        # 买入现货，花费 USDT
+                        if op['amount_type'] == "百分比":
+                            buy_value = sim_luno_value * (op['amount'] / 100)
+                            effective_usdt = buy_value
+                        else:
+                            effective_usdt = op['amount']
+                        sim_luno_value -= effective_usdt
+                
+                # 计算强平价（仅对 Binance 合约有效）
+                if platform == 'binance':
+                    sim_liq = calc_liq_price(sim_binance_equity, sim_qty, sim_entry, short_qty, short_entry, mm_rate, op_price)
                 else:
-                    sell_qty = op['amount'] / op_price if op_price > 0 else 0
-                    sell_qty = min(sell_qty, sim_qty)
-                    effective_usdt = sell_qty * op_price
+                    sim_liq = None  # Luno 现货无强平价
                 
-                realized_pnl = (op_price - sim_entry) * sell_qty
-                sim_equity += realized_pnl
-                sim_qty -= sell_qty
-                
-            else:  # 买入
+                # 格式化显示金额 (总是显示 USDT 估值)
                 if op['amount_type'] == "百分比":
-                    buy_value = (sim_qty * op_price) * (op['amount'] / 100)
-                    buy_qty = buy_value / op_price if op_price > 0 else 0
-                    effective_usdt = buy_value
+                    amount_str = f"{op['amount']:.0f}% (${effective_usdt:,.0f})"
                 else:
-                    buy_qty = op['amount'] / op_price if op_price > 0 else 0
-                    effective_usdt = op['amount']
+                    amount_str = f"${effective_usdt:,.0f}"
                 
-                total_cost = sim_qty * sim_entry + buy_qty * op_price
-                sim_qty += buy_qty
-                sim_entry = total_cost / sim_qty if sim_qty > 0 else op_price
-            
-            # 计算强平价
-            sim_liq = calc_liq_price(sim_equity, sim_qty, sim_entry, short_qty, short_entry, mm_rate, op_price)
-            
-            # 格式化显示金额 (总是显示 USDT 估值)
-            if op['amount_type'] == "百分比":
-                amount_str = f"{op['amount']:.0f}% (${effective_usdt:,.0f})"
-            else:
-                amount_str = f"${effective_usdt:,.0f}"
-            
-            # 显示行
-            c1, c2, c3, c4, c5, c6, c7 = st.columns([0.8, 1.2, 1.4, 1.4, 1.4, 1.2, 0.5]) # 调整列宽给金额
-            
-            # 操作类型带颜色
-            action_color = "green" if op['action'] == "买入" else "red"
-            
-            c1.markdown(f"**{op['action']}**")
-            c2.markdown(f"${op_price:,.0f}")
-            c3.markdown(amount_str)
-            c4.markdown(f"${sim_equity:,.0f}")
-            c5.markdown(f"${sim_qty * op_price:,.0f}")
-            
-            # 强平价根据风险变色
-            liq_delta = sim_liq - current_liq
-            liq_color = "red" if liq_delta > 0 else "green"
-            c6.markdown(f":{liq_color}[${sim_liq:,.0f}]")
-            
-            # 删除按钮
-            if c7.button("🗑️", key=f"del_{idx}_{op_price}", help="删除此操作"):
-                 for j, original_op in enumerate(st.session_state.operations):
-                    if original_op['price'] == op['price'] and original_op['action'] == op['action']:
-                        st.session_state.operations.pop(j)
-                        break
-                 st.rerun()
-            
-            # 加一点行间距
-            st.markdown("<div style='margin-top: -10px'></div>", unsafe_allow_html=True)
+                # 平台标识
+                platform_icon = "🔶" if platform == 'binance' else "🟦"
+                platform_text = f"{'Binance' if platform == 'binance' else 'Luno'}"
+                
+                # 显示行 - 添加余额列
+                c0, c1, c2, c3, c4, c5, c6, c7, c8 = st.columns([0.4, 0.7, 1.0, 1.2, 1.2, 1.2, 1.0, 1.0, 0.4])
+                
+                # 平台标识
+                c0.markdown(f"{platform_icon}")
+                
+                # 操作类型带颜色
+                action_color = "green" if op['action'] == "买入" else "red"
+                
+                c1.markdown(f"**{op['action']}**")
+                c2.markdown(f"${op_price:,.0f}")
+                c3.markdown(amount_str)
+                c4.markdown(f"${sim_luno_value:,.0f}")
+                c5.markdown(f"${sim_binance_equity:,.0f}")
+                c6.markdown(f"${sim_qty * op_price:,.0f}")
+                
+                # 强平价根据风险变色（现货无强平价）
+                if platform == 'binance' and sim_liq is not None:
+                    liq_delta = sim_liq - current_liq
+                    liq_color = "red" if liq_delta > 0 else "green"
+                    c7.markdown(f":{liq_color}[${sim_liq:,.0f}]")
+                else:
+                    c7.markdown("N/A")  # 现货无强平
+                
+                # 删除按钮
+                if c8.button("🗑️", key=f"del_{idx}_{op_price}", help="删除此操作"):
+                     for j, original_op in enumerate(st.session_state.operations):
+                        if original_op['price'] == op['price'] and original_op['action'] == op['action']:
+                            st.session_state.operations.pop(j)
+                            break
+                     st.rerun()
+                
+                # 加一点行间距
+                st.markdown("<div style='margin-top: -10px'></div>", unsafe_allow_html=True)
         
         st.markdown("---")
         
@@ -465,8 +871,8 @@ with row2_col1.container(border=True):
         st.markdown("#### 📈 操作序列执行后")
         final_col1, final_col2, final_col3 = st.columns(3)
         
-        equity_change = sim_equity - binance_equity
-        final_col1.metric("最终权益", f"${sim_equity:,.0f}", 
+        equity_change = sim_binance_equity - binance_equity
+        final_col1.metric("最终权益", f"${sim_binance_equity:,.0f}", 
                          delta=f"{equity_change:+,.0f}",
                          help="执行所有操作后的权益")
         
@@ -478,11 +884,15 @@ with row2_col1.container(border=True):
                          delta_color="off",
                          help=f"执行所有操作后的持仓价值 ({sim_qty:.2f} BTC)")
         
-        liq_change = sim_liq - current_liq
-        final_col3.metric("最终强平价", f"${sim_liq:,.0f}", 
-                         delta=f"{liq_change:+,.0f}",
-                         delta_color="inverse" if liq_change > 0 else "normal",
-                         help="执行所有操作后的强平价")
+        # 强平价只在有 Binance 操作时显示
+        if sim_liq is not None:
+            liq_change = sim_liq - current_liq
+            final_col3.metric("最终强平价", f"${sim_liq:,.0f}", 
+                             delta=f"{liq_change:+,.0f}",
+                             delta_color="inverse" if liq_change > 0 else "normal",
+                             help="执行所有操作后的强平价")
+        else:
+            final_col3.metric("最终强平价", "N/A", help="现货操作无强平风险")
     
     # 快速清空
     if len(st.session_state.operations) > 0:
@@ -534,6 +944,7 @@ with row2_col2.container(border=True):
     
     # === 情景 A: Hold（不操作，保持当前状态到目标价） ===
     # 注意：情景 A 完全不考虑操作序列，只基于当前持仓和目标价
+    # 使用基准值 binance_equity（不考虑资金划转）
     hold_pnl = (target_price - current_price) * (long_qty - short_qty)
     hold_equity_final = binance_equity + hold_pnl
     
@@ -544,7 +955,7 @@ with row2_col2.container(border=True):
         # 计算操作序列到达目标价的结果
         seq_equity, seq_qty, seq_entry, op_points = calculate_operation_sequence(
             st.session_state.operations,
-            binance_equity,
+            st.session_state.binance_equity,
             long_qty,
             long_entry,
             current_price
@@ -587,7 +998,7 @@ with row2_col2.container(border=True):
         else:
             st.info("💡 未设置操作序列，结果与情景A相同")
         st.metric("最终权益", f"${adjusted_equity_final:,.0f}")
-        total_pnl_adjusted = adjusted_equity_final - binance_equity
+        total_pnl_adjusted = adjusted_equity_final - st.session_state.binance_equity
         st.metric("总盈亏", f"${total_pnl_adjusted:,.0f}", 
                   delta=f"vs 现在",
                   delta_color="normal")
@@ -665,13 +1076,13 @@ with st.container(border=True):
             sim_price = current_price
             sim_qty = long_qty
             sim_entry = long_entry
-            sim_equity = binance_equity
+            sim_binance_equity = st.session_state.binance_equity
             
             # 逐个执行触发的操作
             for op in triggered_ops:
                 # 1. 价格变动到操作价
                 price_move_pnl = (op['price'] - sim_price) * (sim_qty - short_qty)
-                sim_equity += price_move_pnl
+                sim_binance_equity += price_move_pnl
                 sim_price = op['price']
                 
                 # 2. 执行操作
@@ -682,7 +1093,7 @@ with st.container(border=True):
                         sell_qty = min(op['amount'] / op['price'], sim_qty)
                     
                     realized_pnl = (op['price'] - sim_entry) * sell_qty
-                    sim_equity += realized_pnl
+                    sim_binance_equity += realized_pnl
                     sim_qty -= sell_qty
                     
                 else:  # 买入
@@ -698,10 +1109,10 @@ with st.container(border=True):
             
             # 3. 从最后一个操作价到目标价格p
             final_move_pnl = (p - sim_price) * (sim_qty - short_qty)
-            sim_equity += final_move_pnl
+            sim_binance_equity += final_move_pnl
             
             # 转换为盈亏
-            pnl_adjusted_curve.append(sim_equity - binance_equity)
+            pnl_adjusted_curve.append(sim_binance_equity - st.session_state.binance_equity)
 
     # 绘制图表
     fig = go.Figure()
