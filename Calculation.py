@@ -268,6 +268,11 @@ def calculate_operation_sequence(operations, start_equity, start_qty, start_entr
     qty = start_qty
     avg_entry = start_entry
     
+    # Excel formula tracking variables
+    prev_price = start_entry
+    net_position = start_qty * start_entry if start_qty > 0 else 0
+    floating_position = net_position
+    
     # operation_points 用于图表标记
     operation_points = []
     
@@ -311,19 +316,40 @@ def calculate_operation_sequence(operations, start_equity, start_qty, start_entr
                 # 百分比基于当前持仓价值
                 buy_value = (qty * op_price) * (op_amount / 100)
                 buy_qty = buy_value / op_price if op_price > 0 else 0
+                effective_usdt = buy_value
             else:  # USDT金额
                 buy_qty = op_amount / op_price if op_price > 0 else 0
+                effective_usdt = op_amount
             
             # **修复**: Binance合约买入需要扣除保证金(10x杠杆)
             platform = op.get('platform', 'binance')
             if platform == 'binance':
-                margin_required = op_amount / 10
+                margin_required = effective_usdt / 10
                 equity -= margin_required
             
-            # 更新加权平均入场价
-            total_cost = qty * avg_entry + buy_qty * op_price
+            # Excel formula: 保存前一个均价
+            prev_avg = avg_entry
+            
+            # Excel formula: Net Position
+            prev_net = net_position
+            net_position += effective_usdt
+            
+            # Excel formula: Floating Position - 价格方向判断
+            if prev_net > 0:
+                if op_price < prev_price:  # 价格下跌
+                    floating_position = effective_usdt + prev_net - (prev_avg - op_price) * prev_net / prev_avg
+                else:  # 价格上涨
+                    floating_position = effective_usdt + prev_net + (prev_avg - op_price) * prev_net / prev_avg
+            else:
+                floating_position = effective_usdt
+            
+            # Excel formula: Average Price
+            if floating_position > 0:
+                avg_entry = ((op_price * effective_usdt) + prev_avg * (floating_position - effective_usdt)) / floating_position
+            
+            # 更新持仓数量
             qty += buy_qty
-            avg_entry = total_cost / qty if qty > 0 else op_price
+            prev_price = op_price
             
             operation_points.append({
                 'price': op_price,
@@ -332,7 +358,7 @@ def calculate_operation_sequence(operations, start_equity, start_qty, start_entr
                 'qty_change': buy_qty
             })
     
-    return equity, qty, avg_entry, operation_points
+    return equity, qty, avg_entry, net_position, operation_points
 
 # ==========================================
 # 3. 界面布局 (UI Layout)
@@ -1206,7 +1232,7 @@ with row2_col2.container(border=True):
         # ⚠️ 核心修复：只用 calculate_operation_sequence 获取最终持仓数量和加权均价
         # 不使用它返回的 seq_equity，因为那是增量累加的结果，会导致重复计算
         # 按时间顺序执行操作（匹配Excel）
-        _, seq_qty, seq_entry, op_points = calculate_operation_sequence(
+        _, seq_qty, seq_entry, seq_net_position, op_points = calculate_operation_sequence(
             st.session_state.operations,  # 直接使用时间顺序
             st.session_state.binance_equity,
             long_qty,
@@ -1216,9 +1242,11 @@ with row2_col2.container(border=True):
         op_points_for_chart = op_points # 保存给图表使用
         
         # ⚠️ Excel逻辑（绝对值计算）：
-        # 浮盈 = (目标价 - 加权均价) × 总持仓
+        # 有效持仓数量 = 净持仓 / 均价
+        # 浮盈 = (目标价 - 均价) × 有效持仓数量
         # 剩余资金（止盈）= 总资金 + 浮盈
-        floating_pnl = (target_price - seq_entry) * (seq_qty - short_qty)
+        effective_qty = seq_net_position / seq_entry if seq_entry > 0 else 0
+        floating_pnl = (target_price - seq_entry) * effective_qty
         adjusted_equity_final = st.session_state.binance_equity + floating_pnl
         
         adjusted_qty_display = seq_qty
