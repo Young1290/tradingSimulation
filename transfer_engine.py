@@ -1,6 +1,6 @@
 """
 资金划转引擎 (Fund Transfer Engine)
-用于计算和执行 Luno 现货与 Binance 合约之间的资金划转
+用于计算和执行 Binance现货 现货与 Binance 合约之间的资金划转
 """
 
 def calculate_min_margin_required(long_qty, long_entry, short_qty, short_entry, mm_rate, current_price, safety_multiplier=1.5):
@@ -33,14 +33,14 @@ def calculate_min_margin_required(long_qty, long_entry, short_qty, short_entry, 
     return min_margin_with_buffer
 
 
-def calculate_available_to_transfer(direction, luno_value, binance_equity, long_qty, long_entry, 
+def calculate_available_to_transfer(direction, spot_value, binance_equity, long_qty, long_entry, 
                                     short_qty, short_entry, mm_rate, current_price):
     """
     计算可划转的最大金额
     
     Args:
-        direction: 'luno_to_binance' 或 'binance_to_luno'
-        luno_value: Luno 现货价值
+        direction: 'spot_to_contract' 或 'contract_to_spot'
+        spot_value: Binance现货 现货价值
         binance_equity: Binance 权益
         long_qty, long_entry, short_qty, short_entry: 持仓信息
         mm_rate: 维持保证金率
@@ -49,11 +49,11 @@ def calculate_available_to_transfer(direction, luno_value, binance_equity, long_
     Returns:
         float: 最大可划转金额 (USDT)
     """
-    if direction == 'luno_to_binance':
-        # Luno 可以全部划转
-        return luno_value
+    if direction == 'spot_to_contract':
+        # Binance现货 可以全部划转
+        return spot_value
     
-    elif direction == 'binance_to_luno':
+    elif direction == 'contract_to_spot':
         # Binance 需要保留足够保证金
         min_margin = calculate_min_margin_required(
             long_qty, long_entry, short_qty, short_entry, 
@@ -69,7 +69,7 @@ def calculate_available_to_transfer(direction, luno_value, binance_equity, long_
     return 0.0
 
 
-def validate_transfer(direction, amount, luno_value, binance_equity, long_qty, long_entry,
+def validate_transfer(direction, amount, spot_value, binance_equity, long_qty, long_entry,
                      short_qty, short_entry, mm_rate, current_price, calc_liq_price_func=None, min_buffer_percent=10.0):
     """
     验证划转是否安全
@@ -88,18 +88,18 @@ def validate_transfer(direction, amount, luno_value, binance_equity, long_qty, l
         return False, "划转金额无效", ""
     
     # 方向特定验证
-    if direction == 'luno_to_binance':
-        if amount > luno_value:
-            return False, f"划转金额超过 Luno 可用余额 (${luno_value:,.0f})", ""
+    if direction == 'spot_to_contract':
+        if amount > spot_value:
+            return False, f"划转金额超过 Binance现货 可用余额 (${spot_value:,.0f})", ""
         
-        # 划转后 Luno 余额
-        luno_after = luno_value - amount
+        # 划转后 Binance现货 余额
+        luno_after = spot_value - amount
         if luno_after < 0:
-            return False, "划转后 Luno 余额不足", ""
+            return False, "划转后 Binance现货 余额不足", ""
         
         return True, "", ""
     
-    elif direction == 'binance_to_luno':
+    elif direction == 'contract_to_spot':
         if amount > binance_equity:
             return False, f"划转金额超过 Binance 可用权益 (${binance_equity:,.0f})", ""
         
@@ -130,26 +130,26 @@ def validate_transfer(direction, amount, luno_value, binance_equity, long_qty, l
     return False, "未知的划转方向", ""
 
 
-def execute_transfer(direction, amount, luno_value, binance_equity):
+def execute_transfer(direction, amount, spot_value, binance_equity):
     """
     执行资金划转
     
     Returns:
-        tuple: (new_luno_value, new_binance_equity)
+        tuple: (new_spot_value, new_binance_equity)
     """
-    if direction == 'luno_to_binance':
-        new_luno = luno_value - amount
+    if direction == 'spot_to_contract':
+        new_luno = spot_value - amount
         new_binance = binance_equity + amount
-    elif direction == 'binance_to_luno':
-        new_luno = luno_value + amount
+    elif direction == 'contract_to_spot':
+        new_luno = spot_value + amount
         new_binance = binance_equity - amount
     else:
-        return luno_value, binance_equity
+        return spot_value, binance_equity
     
     return new_luno, new_binance
 
 
-def calculate_transfer_impact(direction, amount, luno_value, binance_equity, 
+def calculate_transfer_impact(direction, amount, spot_value, binance_equity, 
                               long_qty, long_entry, short_qty, short_entry, 
                               mm_rate, current_price, calc_liq_price_func):
     """
@@ -167,16 +167,16 @@ def calculate_transfer_impact(direction, amount, luno_value, binance_equity,
     current_buffer = (current_price - current_liq) / current_price * 100 if current_price > 0 else 0
     
     # 执行划转后的状态
-    new_luno, new_binance = execute_transfer(direction, amount, luno_value, binance_equity)
+    new_luno, new_binance = execute_transfer(direction, amount, spot_value, binance_equity)
     
     new_liq = calc_liq_price_func(new_binance, long_qty, long_entry,
                             short_qty, short_entry, mm_rate, current_price)
     new_buffer = (current_price - new_liq) / current_price * 100 if current_price > 0 else 0
     
     return {
-        'luno_before': luno_value,
+        'luno_before': spot_value,
         'luno_after': new_luno,
-        'luno_change': new_luno - luno_value,
+        'luno_change': new_luno - spot_value,
         'binance_before': binance_equity,
         'binance_after': new_binance,
         'binance_change': new_binance - binance_equity,
@@ -186,6 +186,6 @@ def calculate_transfer_impact(direction, amount, luno_value, binance_equity,
         'buffer_before': current_buffer,
         'buffer_after': new_buffer,
         'buffer_change': new_buffer - current_buffer,
-        'total_portfolio_before': luno_value + binance_equity,
+        'total_portfolio_before': spot_value + binance_equity,
         'total_portfolio_after': new_luno + new_binance,
     }
