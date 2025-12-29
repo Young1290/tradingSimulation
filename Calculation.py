@@ -284,11 +284,15 @@ def calculate_operation_sequence(operations, start_equity, start_qty, start_entr
         op_amount_type = op['amount_type']
         op_amount = op['amount']
         
-        # 计算从当前价到操作点的P&L变化
-        price_delta = op_price - current_p
-        pnl = price_delta * (qty - short_qty)
-        equity += pnl
-        current_p = op_price  # 更新"当前价"为操作价
+        
+        # ⚠️ 修复：移除价格移动PnL累加
+        # 原逻辑会累加未实现盈亏到equity，导致与目标价推演的重复计算
+        # Excel设计中"资金"列保持不变，只有操作才改变equity
+        # price_delta = op_price - current_p
+        # pnl = price_delta * (qty - short_qty)
+        # equity += pnl  # ❌ 删除此行
+        
+        current_p = op_price  # 只更新当前价格追踪
         
         if op_action == "卖出":
             # 计算卖出数量
@@ -302,6 +306,14 @@ def calculate_operation_sequence(operations, start_equity, start_qty, start_entr
             realized_pnl = (op_price - avg_entry) * sell_qty
             equity += realized_pnl
             qty -= sell_qty
+            
+            # ⚠️ 关键修复：卖出后更新 net_position 和 floating_position
+            # 卖出比例
+            sell_ratio = sell_qty / (qty + sell_qty) if (qty + sell_qty) > 0 else 0
+            
+            # 按比例减少净持仓和浮动持仓
+            net_position = net_position * (1 - sell_ratio)
+            floating_position = floating_position * (1 - sell_ratio)
             
             operation_points.append({
                 'price': op_price,
@@ -321,11 +333,13 @@ def calculate_operation_sequence(operations, start_equity, start_qty, start_entr
                 buy_qty = op_amount / op_price if op_price > 0 else 0
                 effective_usdt = op_amount
             
-            # **修复**: Binance合约买入需要扣除保证金(10x杠杆)
-            platform = op.get('platform', 'binance')
-            if platform == 'binance':
-                margin_required = effective_usdt / 10
-                equity -= margin_required
+            
+            # ⚠️ 匹配Excel：不扣除保证金
+            # Excel假设不占用保证金或全额买入
+            # platform = op.get('platform', 'binance')
+            # if platform == 'binance':
+            #     margin_required = effective_usdt / 10
+            #     equity -= margin_required
             
             # Excel formula: 保存前一个均价
             prev_avg = avg_entry
@@ -459,7 +473,7 @@ with st.container(border=True):
     # Row 2: Binance 合约
     st.markdown("#### Binance 合约")
     b1, b2 = st.columns(2)
-    b1.metric("Binance 权益", f"${binance_equity:,.0f}", help="合约账户净值")
+    b1.metric("Binance 权益", f"${binance_equity:,.0f}", help="初始本金（不含未实现盈亏，参考Excel设计）")
     b2.metric("未实现盈亏", f"${(current_price-long_entry)*long_qty + (short_entry-current_price)*short_qty:,.0f}")
     
     st.markdown("---")
@@ -892,8 +906,8 @@ with row2_col1.container(border=True):
         # 按时间顺序执行操作（匹配Excel）
         sorted_ops = st.session_state.operations  # 保持原始添加顺序
         
-        # 表格表头 - 新增币本位BTC和总权益列
-        h0, h1, h2, h3, h4, h5, h6, h7, h8, h9 = st.columns([0.4, 0.7, 1.0, 1.0, 0.9, 0.9, 1.1, 1.1, 1.0, 0.4])
+        # 表格表头 - 移除总权益列
+        h0, h1, h2, h3, h4, h5, h6, h7, h8 = st.columns([0.4, 0.7, 1.0, 1.0, 0.9, 0.9, 1.1, 1.0, 0.4])
         h0.markdown("**平台**")
         h1.markdown("**操作**")
         h2.markdown("**触发价**")
@@ -901,9 +915,8 @@ with row2_col1.container(border=True):
         h4.markdown("**持仓均价**")
         h5.markdown("**币本位 BTC**")
         h6.markdown("**Binance (U)**")
-        h7.markdown("**总权益**")
-        h8.markdown("**强平价**")
-        h9.write("") # 删除按钮列
+        h7.markdown("**强平价**")
+        h8.write("") # 删除按钮列
         
         st.markdown("---")
         
@@ -971,6 +984,15 @@ with row2_col1.container(border=True):
                         realized_pnl = (op_price - sim_entry) * sell_qty
                         sim_binance_equity += realized_pnl
                         sim_qty -= sell_qty
+                        
+                        # ⚠️ 关键修复：卖出后更新 net_position 和 floating_position
+                        # 卖出比例
+                        sell_ratio = sell_qty / (sim_qty + sell_qty) if (sim_qty + sell_qty) > 0 else 0
+                        
+                        # 按比例减少净持仓和浮动持仓
+                        net_position = net_position * (1 - sell_ratio)
+                        floating_position = floating_position * (1 - sell_ratio)
+                        
                     else:  # 买入 - 使用Excel公式
                         if op['amount_type'] == "百分比":
                             buy_value = (sim_qty * op_price) * (op['amount'] / 100)
@@ -1051,11 +1073,13 @@ with row2_col1.container(border=True):
                     # 强平价 = 均价 - (初始权益 / 净持仓) * 均价
                     if net_position > 0:
                         sim_liq = sim_entry - (initial_equity_for_liq / net_position) * sim_entry
+                        sim_liq = max(0.0, sim_liq)  # ⚠️ 强平价不能为负数
                     else:
                         sim_liq = 0
                 elif platform == 'coin_margined':
                     # 币本位使用预先计算的强平价
                     sim_liq = op.get('liq_price', 0)
+                    sim_liq = max(0.0, sim_liq)  # ⚠️ 强平价不能为负数
                 else:
                     sim_liq = None  # Binance 现货无强平价
                 
@@ -1079,8 +1103,8 @@ with row2_col1.container(border=True):
                     platform_icon = "❓"
                     platform_text = "未知"
                 
-                # 显示行 - 新的列结构：现货 BTC | 币本位 BTC | Binance (U) | 总权益
-                c0, c1, c2, c3, c4, c5, c6, c7, c8, c9 = st.columns([0.4, 0.7, 1.0, 1.0, 0.9, 0.9, 1.1, 1.1, 1.0, 0.4])
+                # 显示行 - 移除总权益列
+                c0, c1, c2, c3, c4, c5, c6, c7, c8 = st.columns([0.4, 0.7, 1.0, 1.0, 0.9, 0.9, 1.1, 1.0, 0.4])
                 
                 # 平台标识
                 c0.markdown(f"{platform_icon}")
@@ -1101,24 +1125,19 @@ with row2_col1.container(border=True):
                 # Binance U本位 USDT
                 c6.markdown(f"${sim_binance_equity:,.0f}")
                 
-                # 总权益 (USD)
-                total_equity_usd = sim_binance_equity + sim_luno_value + sim_coin_margined_btc * op_price
-                c7.markdown(f"${total_equity_usd:,.0f}")
-
-                
                 # 强平价显示（根据平台类型）
                 if platform == 'binance' and sim_liq is not None:
                     liq_delta = sim_liq - current_liq
                     liq_color = "red" if liq_delta > 0 else "green"
-                    c8.markdown(f":{liq_color}[${sim_liq:,.0f}]")
+                    c7.markdown(f":{liq_color}[${sim_liq:,.0f}]")
                 elif platform == 'coin_margined' and sim_liq is not None:
                     # 币本位显示预设的强平价
-                    c8.markdown(f"${sim_liq:,.0f}")
+                    c7.markdown(f"${sim_liq:,.0f}")
                 else:
-                    c8.markdown("N/A")  # 现货无强平
+                    c7.markdown("N/A")  # 现货无强平
                 
                 # 删除按钮
-                if c9.button("🗑️", key=f"del_{idx}_{op_price}", help="删除此操作"):
+                if c8.button("🗑️", key=f"del_{idx}_{op_price}", help="删除此操作"):
                      for j, original_op in enumerate(st.session_state.operations):
                         if original_op['price'] == op['price'] and original_op['action'] == op['action']:
                             st.session_state.operations.pop(j)
@@ -1132,7 +1151,7 @@ with row2_col1.container(border=True):
         
         # 显示最终状态总结
         st.markdown("#### 📈 操作序列执行后")
-        final_col1, final_col2, final_col3, final_col4 = st.columns(4)
+        final_col1, final_col2, final_col3 = st.columns(3)
         
         # 计算最终价格（最后一个操作的价格）
         final_price = sorted_ops[-1]['price'] if len(sorted_ops) > 0 else current_price
@@ -1143,32 +1162,28 @@ with row2_col1.container(border=True):
                          delta=f"{equity_change:+,.0f}",
                          help="U本位合约账户USDT余额")
         
-        # Luno + 币本位 BTC总量
-        luno_btc_final = sim_luno_value / final_price if final_price > 0 else 0
-        total_btc = luno_btc_final + sim_coin_margined_btc
-        btc_change = total_btc - (st.session_state.binance_spot_value / current_price + st.session_state.coin_margined_btc)
-        final_col2.metric("BTC总量", f"{total_btc:.4f} BTC", 
-                         delta=f"{btc_change:+.4f}",
-                         delta_color="off",
-                         help=f"Luno现货 + 币本位账户")
+        # U本位合约净持仓（USDT计价）- 会随买入/卖出变动
+        # net_position 代表虚拟的合约仓位价值
+        initial_net_position = long_qty * long_entry if long_qty > 0 else 0
+        net_position_change = net_position - initial_net_position
         
-        # 总权益 (USD)
-        total_equity_final = sim_binance_equity + total_btc * final_price
-        initial_total_equity = st.session_state.binance_equity + (st.session_state.binance_spot_value / current_price + st.session_state.coin_margined_btc) * current_price
-        total_equity_change = total_equity_final - initial_total_equity
-        final_col3.metric("总权益", f"${total_equity_final:,.0f}", 
-                         delta=f"{total_equity_change:+,.0f}",
-                         help="所有账户USD总价值")
+        # 计算对应的BTC数量（用于tooltip）
+        position_btc = net_position / final_price if final_price > 0 else 0
+        
+        final_col2.metric("持仓总量", f"${net_position:,.0f}", 
+                         delta=f"{net_position_change:+,.0f}",
+                         help=f"U本位合约净持仓价值 (约 {position_btc:.4f} BTC)")
+        
         
         # 强平价只在有 Binance 操作时显示
         if sim_liq is not None:
             liq_change = sim_liq - current_liq
-            final_col4.metric("U本位强平价", f"${sim_liq:,.0f}", 
+            final_col3.metric("U本位强平价", f"${sim_liq:,.0f}", 
                              delta=f"{liq_change:+,.0f}",
                              delta_color="inverse" if liq_change > 0 else "normal",
                              help="U本位合约强平价")
         else:
-            final_col4.metric("U本位强平价", "N/A", help="无U本位操作")
+            final_col3.metric("U本位强平价", "N/A", help="无U本位操作")
 
     
     # 快速清空
@@ -1229,10 +1244,9 @@ with row2_col2.container(border=True):
     op_points_for_chart = [] # 存储用于绘图的操作点
     
     if len(st.session_state.operations) > 0:
-        # ⚠️ 核心修复：只用 calculate_operation_sequence 获取最终持仓数量和加权均价
-        # 不使用它返回的 seq_equity，因为那是增量累加的结果，会导致重复计算
-        # 按时间顺序执行操作（匹配Excel）
-        _, seq_qty, seq_entry, seq_net_position, op_points = calculate_operation_sequence(
+        # ⚠️ 核心修复：calculate_operation_sequence 返回执行操作后的实际权益
+        # 包括所有卖出的实现盈亏（可能是亏损）
+        seq_equity, seq_qty, seq_entry, seq_net_position, op_points = calculate_operation_sequence(
             st.session_state.operations,  # 直接使用时间顺序
             st.session_state.binance_equity,
             long_qty,
@@ -1242,20 +1256,33 @@ with row2_col2.container(border=True):
         op_points_for_chart = op_points # 保存给图表使用
         
         # ⚠️ Excel逻辑（绝对值计算）：
+        # 从当前价到目标价的浮盈
         # 有效持仓数量 = 净持仓 / 均价
-        # 浮盈 = (目标价 - 均价) × 有效持仓数量
-        # 剩余资金（止盈）= 总资金 + 浮盈
+        # 浮盈 = (目标价 - 当前价) × 有效持仓数量
+        # 最终权益 = 操作后权益 + 浮盈
         effective_qty = seq_net_position / seq_entry if seq_entry > 0 else 0
-        floating_pnl = (target_price - seq_entry) * effective_qty
-        adjusted_equity_final = st.session_state.binance_equity + floating_pnl
+        floating_pnl = (target_price - seq_entry) * effective_qty  # Excel: (H-F)*D/F
+        adjusted_equity_final = seq_equity + floating_pnl  # ⚠️ 修复：使用操作后权益
         
         adjusted_qty_display = seq_qty
         strategy_label = f"操作序列 ({len(st.session_state.operations)}步)"
+        
+        # 计算执行操作序列后的最终强平价
+        final_liq_after_ops = calc_liq_price(
+            seq_equity,  # ⚠️ 修复：使用操作后的实际权益
+            seq_qty,  # 使用操作后的持仓数量
+            seq_entry,  # 使用操作后的均价
+            short_qty, 
+            short_entry, 
+            mm_rate, 
+            current_price
+        )
     else:
         # 没有操作，等同于 Hold
         adjusted_equity_final = hold_equity_final
         adjusted_qty_display = long_qty
         strategy_label = "无操作 (= Hold)"
+        final_liq_after_ops = current_liq  # 没有操作，强平价不变
     
     # 显示对比
     col_hold, col_adjusted = st.columns(2)
@@ -1263,8 +1290,8 @@ with row2_col2.container(border=True):
     with col_hold:
         st.markdown("**情景 A: Hold (死扛)**")
         st.info("💡 不考虑任何操作，保持当前持仓到目标价")
-        st.metric("最终权益", f"${hold_equity_final:,.0f}")
-        st.metric("总盈亏", f"${hold_pnl:,.0f}", 
+        st.metric("剩余资金(止盈)", f"${hold_equity_final:,.0f}")
+        st.metric("浮盈", f"${hold_pnl:,.0f}", 
                   delta=f"vs 现在",
                   delta_color="normal")
     
@@ -1275,9 +1302,9 @@ with row2_col2.container(border=True):
             st.info(f"⚙️ 考虑第2板块的 {len(st.session_state.operations)} 个操作")
         else:
             st.info("💡 未设置操作序列，结果与情景A相同")
-        st.metric("最终权益", f"${adjusted_equity_final:,.0f}")
+        st.metric("剩余资金(止盈)", f"${adjusted_equity_final:,.0f}")
         total_pnl_adjusted = adjusted_equity_final - st.session_state.binance_equity
-        st.metric("总盈亏", f"${total_pnl_adjusted:,.0f}", 
+        st.metric("浮盈", f"${total_pnl_adjusted:,.0f}", 
                   delta=f"vs 现在",
                   delta_color="normal")
     
@@ -1379,6 +1406,15 @@ with st.container(border=True):
                     sell_qty = sim_qty * (op['amount'] / 100)
                 else:
                     sell_qty = min(op['amount'] / op['price'], sim_qty)
+                
+                # ⚠️ 关键修复：卖出后更新 net_position_chart 和 floating_position_chart
+                # 卖出比例
+                sell_ratio = sell_qty / sim_qty if sim_qty > 0 else 0
+                
+                # 按比例减少净持仓和浮动持仓
+                net_position_chart = net_position_chart * (1 - sell_ratio)
+                floating_position_chart = floating_position_chart * (1 - sell_ratio)
+                
                 sim_qty -= sell_qty
                 
             else:  # 买入 - 使用Excel公式
