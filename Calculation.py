@@ -906,8 +906,8 @@ with row2_col1.container(border=True):
         # 按时间顺序执行操作（匹配Excel）
         sorted_ops = st.session_state.operations  # 保持原始添加顺序
         
-        # 表格表头 - 移除总权益列
-        h0, h1, h2, h3, h4, h5, h6, h7, h8 = st.columns([0.4, 0.7, 1.0, 1.0, 0.9, 0.9, 1.1, 1.0, 0.4])
+        # 表格表头 - 添加实时盈亏列
+        h0, h1, h2, h3, h4, h5, h6, h7, h8, h9 = st.columns([0.4, 0.7, 0.9, 0.9, 0.85, 0.85, 1.0, 0.9, 0.9, 0.4])
         h0.markdown("**平台**")
         h1.markdown("**操作**")
         h2.markdown("**触发价**")
@@ -916,7 +916,8 @@ with row2_col1.container(border=True):
         h5.markdown("**币本位 BTC**")
         h6.markdown("**Binance (U)**")
         h7.markdown("**强平价**")
-        h8.write("") # 删除按钮列
+        h8.markdown("**浮盈亏**")
+        h9.write("") # 删除按钮列
         
         st.markdown("---")
         
@@ -970,6 +971,11 @@ with row2_col1.container(border=True):
                 # --- 执行操作并计算实际金额 ---
                 effective_usdt = 0.0
                 
+                # === 新增：保存操作相关信息用于PnL计算 ===
+                operation_qty = 0.0  # 本次操作涉及的数量
+                entry_price_before_op = sim_entry  # 操作前的持仓均价
+                qty_before_op = sim_qty  # 操作前的总持仓数量
+                
                 if platform == 'binance':
                     # Binance 合约操作 (10x 杠杆)
                     if op['action'] == "卖出":
@@ -980,6 +986,8 @@ with row2_col1.container(border=True):
                             sell_qty = op['amount'] / op_price if op_price > 0 else 0
                             sell_qty = min(sell_qty, sim_qty)
                             effective_usdt = sell_qty * op_price
+                        
+                        operation_qty = sell_qty  # 保存卖出数量用于PnL显示
                         
                         realized_pnl = (op_price - sim_entry) * sell_qty
                         sim_binance_equity += realized_pnl
@@ -1029,6 +1037,8 @@ with row2_col1.container(border=True):
                         if floating_position > 0:
                             sim_entry = ((op_price * effective_usdt) + sim_entry * (floating_position - effective_usdt)) / floating_position
                         
+                        operation_qty = buy_qty  # 保存买入数量用于PnL显示
+                        
                         # 更新持仓数量
                         sim_qty += buy_qty
                         
@@ -1045,6 +1055,8 @@ with row2_col1.container(border=True):
                             effective_usdt = sell_value
                         else:
                             effective_usdt = op['amount']
+                        
+                        operation_qty = effective_usdt / op_price if op_price > 0 else 0  # 现货卖出数量
                         sim_luno_value += effective_usdt
                     else:  # 买入
                         # 买入现货，花费 USDT
@@ -1053,6 +1065,8 @@ with row2_col1.container(border=True):
                             effective_usdt = buy_value
                         else:
                             effective_usdt = op['amount']
+                        
+                        operation_qty = effective_usdt / op_price if op_price > 0 else 0  # 现货买入数量
                         sim_luno_value -= effective_usdt
                 
                 elif platform == 'coin_margined':
@@ -1103,8 +1117,8 @@ with row2_col1.container(border=True):
                     platform_icon = "❓"
                     platform_text = "未知"
                 
-                # 显示行 - 移除总权益列
-                c0, c1, c2, c3, c4, c5, c6, c7, c8 = st.columns([0.4, 0.7, 1.0, 1.0, 0.9, 0.9, 1.1, 1.0, 0.4])
+                # 显示行 - 添加实时盈亏列
+                c0, c1, c2, c3, c4, c5, c6, c7, c8, c9 = st.columns([0.4, 0.7, 0.9, 0.9, 0.85, 0.85, 1.0, 0.9, 0.9, 0.4])
                 
                 # 平台标识
                 c0.markdown(f"{platform_icon}")
@@ -1136,13 +1150,48 @@ with row2_col1.container(border=True):
                 else:
                     c7.markdown("N/A")  # 现货无强平
                 
+                # === 新增：实时盈亏计算 ===
+                # 计算总持仓在操作价格点的浮动盈亏
+                # 公式：(操作价格 - 操作后的加权均价) × 操作后的总持仓数量
+                operation_pnl = 0.0
+                
+                if platform == 'binance':
+                    # Binance 合约操作
+                    # 使用操作前的状态计算总持仓浮盈亏
+                    # 公式：(操作价格 - 操作前均价) × 操作前总持仓
+                    operation_pnl = (op_price - entry_price_before_op) * qty_before_op
+                
+                elif platform == 'binance_spot':
+                    # Binance 现货操作
+                    # 现货的浮盈亏计算类似，但基于现货持仓价值
+                    # 简化：假设现货持仓的平均成本难以追踪，暂时显示0
+                    operation_pnl = 0
+                
+                elif platform == 'coin_margined':
+                    # 币本位合约 - 暂时显示为0（需要完整的持仓追踪）
+                    operation_pnl = 0
+                
+                # 显示浮盈亏（带颜色）
+                if operation_pnl > 0:
+                    pnl_color = "green"
+                    pnl_text = f"+${operation_pnl:,.0f}"
+                elif operation_pnl < 0:
+                    pnl_color = "red"
+                    pnl_text = f"-${abs(operation_pnl):,.0f}"
+                else:
+                    pnl_color = "gray"
+                    pnl_text = "$0"
+                
+                c8.markdown(f":{pnl_color}[{pnl_text}]")
+                
                 # 删除按钮
-                if c8.button("🗑️", key=f"del_{idx}_{op_price}", help="删除此操作"):
+                if c9.button("🗑️", key=f"del_{idx}_{op_price}", help="删除此操作"):
                      for j, original_op in enumerate(st.session_state.operations):
                         if original_op['price'] == op['price'] and original_op['action'] == op['action']:
                             st.session_state.operations.pop(j)
                             break
                      st.rerun()
+
                 
                 # 加一点行间距
                 st.markdown("<div style='margin-top: -10px'></div>", unsafe_allow_html=True)
@@ -1592,9 +1641,9 @@ with st.container(border=True):
 
     # 布局美化
     fig.update_layout(
-        title="实时盈亏走势图 (Profit & Loss Projection)",
+        title="浮盈亏走势图 (Profit & Loss Projection)",
         xaxis_title="BTC 价格 (USDT)",
-        yaxis_title="实时盈亏 (USDT)",
+        yaxis_title="浮盈亏 (USDT)",
         template="plotly_white",
         height=500,
         hovermode="x unified",
