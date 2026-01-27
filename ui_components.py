@@ -93,7 +93,7 @@ def render_operation_table(operations, current_price):
     if table_data:
         import pandas as pd
         df = pd.DataFrame(table_data)
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(df, hide_index=True)
 
 
 def render_price_badge(price, label="Current Price"):
