@@ -310,25 +310,25 @@ def generate_paired_prices(
     
     确保：
     1. 买入价在买入区间内均匀分布
-    2. 每个卖出价 = 对应买入价 × (1.06 ~ 1.08)
-    3. 卖出价在卖出区间内
+    2. 卖出价在卖出区间内均匀分布
+    3. 买卖价格独立分散（不再强制基于价差计算）
     """
     buy_segment = (buy_zone_high - buy_zone_low) / n_rounds
+    sell_segment = (sell_zone_high - sell_zone_low) / n_rounds
     
     buy_prices = []
     sell_prices = []
     
     for i in range(n_rounds):
         # 买入价：在第i段内随机选择
-        seg_low = buy_zone_low + i * buy_segment
-        seg_high = buy_zone_low + (i + 1) * buy_segment
-        buy_price = rng.uniform(seg_low, seg_high)
+        buy_seg_low = buy_zone_low + i * buy_segment
+        buy_seg_high = buy_zone_low + (i + 1) * buy_segment
+        buy_price = rng.uniform(buy_seg_low, buy_seg_high)
         
-        # 卖出价：买入价 × (1.06 ~ 1.08)
-        sell_price = buy_price * rng.uniform(1 + min_spread, 1 + max_spread)
-        
-        # 确保卖出价在卖出区间内
-        sell_price = np.clip(sell_price, sell_zone_low, sell_zone_high)
+        # 卖出价：在第i段内随机选择（独立分布）
+        sell_seg_low = sell_zone_low + i * sell_segment
+        sell_seg_high = sell_zone_low + (i + 1) * sell_segment
+        sell_price = rng.uniform(sell_seg_low, sell_seg_high)
         
         buy_prices.append(buy_price)
         sell_prices.append(sell_price)
@@ -538,10 +538,13 @@ def evaluate_solution(
     评估方案
     
     权重分配：
-    - 分散性（间距+均匀）：40%
-    - 价差合理性：25%
-    - 安全性：20%
-    - 盈利：15%
+    - 安全性（强平价）：40% - 硬约束（在上限内=满分，超限=0分）
+    - 分散性（间距+均匀）：30%
+    - 价差合理性：20%
+    - 盈利：10%
+    
+    注意：安全性采用二元评分，不再奖励"过度安全"，
+    这样AI可以生成接近强平价上限的方案
     """
     result = simulate_grid_strategy(buy_prices, sell_prices, config)
     
@@ -561,23 +564,24 @@ def evaluate_solution(
     else:
         spread_score = spread_ratio * 0.5
     
-    # 4. 安全性得分
+    # 4. 安全性得分（强平价约束 - 权重提高至40%）
+    # 修改：只要在上限内就给满分，不再奖励"过度安全"
+    # 这样AI可以生成接近上限的方案，而不是总是追求极低的强平价
     if not result['all_safe']:
-        safety_score = 0
+        safety_score = 0  # 超限直接0分
     else:
-        margin = (config.max_liq_price - result['max_liq_price']) / config.max_liq_price
-        safety_score = 0.5 + 0.5 * margin
+        safety_score = 1.0  # 在上限内直接满分
     
     # 5. 盈利得分
     profit_score = min(1.0, result['total_realized_pnl'] / 25000)
     
-    # 加权
+    # 加权（安全性优先）
     total_score = (
-        gap_score * 0.20 +
-        uniformity_score * 0.20 +
-        spread_score * 0.25 +
-        safety_score * 0.20 +
-        profit_score * 0.15
+        gap_score * 0.15 +
+        uniformity_score * 0.15 +
+        spread_score * 0.20 +
+        safety_score * 0.40 +
+        profit_score * 0.10
     )
     
     # 硬约束惩罚
@@ -747,15 +751,7 @@ def calculate_operation_sequence(operations, start_equity, start_qty, start_entr
             
             # ⚠️ 修复：按实际卖出数量计算盈亏
             actual_sell_value = sell_qty * avg_entry
-            
-            # ⚠️ 支持AI配对操作（与操作列表显示一致）
-            paired_buy_price = op.get('paired_buy_price', None)
-            if paired_buy_price is not None:
-                # AI配对操作：盈亏 = 卖出数量 × (卖出价 - 买入价)
-                realized_pnl = sell_qty * (op_price - paired_buy_price)
-            else:
-                # 普通操作：使用持仓均价
-                realized_pnl = actual_sell_value * (op_price - avg_entry) / avg_entry if avg_entry > 0 else 0
+            realized_pnl = actual_sell_value * (op_price - avg_entry) / avg_entry if avg_entry > 0 else 0
             equity += realized_pnl
             
             # ⚠️ 修复：卖出时释放对应的保证金
@@ -1346,6 +1342,9 @@ with row2_col1.container(border=True):
             st.session_state.grid_saved_amount_per_round = 100000.0
         if 'grid_saved_n_rounds' not in st.session_state:
             st.session_state.grid_saved_n_rounds = 3
+        # 追踪上次优化时使用的强平价上限
+        if 'grid_saved_max_liq' not in st.session_state:
+            st.session_state.grid_saved_max_liq = 28000.0
         
         # ========== 自动读取资产概览数据 ==========
         grid_current_qty = long_qty if long_qty > 0 else 25.0
@@ -1361,60 +1360,51 @@ with row2_col1.container(border=True):
         
         st.markdown("#### ⚙️ 策略参数")
         
-        # 显示自动读取的数据（只读）
-        st.markdown("**📊 自动读取的持仓数据**")
-        info_col1, info_col2, info_col3, info_col4 = st.columns(4)
-        info_col1.metric("当前持仓", f"{grid_current_qty:.2f} BTC")
-        info_col2.metric("持仓均价", f"${grid_entry_price:,.0f}")
-        info_col3.metric("当前强平价", f"${grid_current_liq:,.0f}")
-        info_col4.metric("可用资金", f"${grid_available_capital:,.0f}")
+        # 显示关键数据（只读）
+        info_col1, info_col2 = st.columns(2)
+        info_col1.metric("当前强平价", f"${grid_current_liq:,.0f}")
+        info_col2.metric("可用资金", f"${grid_available_capital:,.0f}")
         
         st.markdown("---")
         
-        # ========== 用户需要输入的参数（简化版）==========
-        # 只需要输入买入区间和卖出区间，AI自动生成最优价格
+        # ========== 用户需要输入的参数（极简版）==========
+        # 只需要输入2个价格，AI自动生成区间
         
         range_col1, range_col2 = st.columns(2)
         
         with range_col1:
-            st.markdown("**📉 买入区间**")
-            st.caption("价格跌到这个区间时，AI会生成买入价格")
-            grid_buy_low = st.number_input(
-                "区间下限", 
-                value=85000.0,
-                min_value=1.0,
+            grid_buy_center = st.number_input(
+                "📉 买入价格",
+                value=80000.0,
+                min_value=10000.0,
+                max_value=200000.0,
                 step=1000.0,
-                key="grid_buy_low",
-                help="买入区间的最低价格"
-            )
-            grid_buy_high = st.number_input(
-                "区间上限", 
-                value=88000.0,
-                min_value=1.0,
-                step=1000.0,
-                key="grid_buy_high",
-                help="买入区间的最高价格"
+                key="grid_buy_center",
+                help="AI会在此价格上下浮动生成买入区间"
             )
         
         with range_col2:
-            st.markdown("**📈 卖出区间**")
-            st.caption("价格涨到这个区间时，AI会生成卖出价格")
-            grid_sell_low = st.number_input(
-                "区间下限", 
-                value=91000.0,
-                min_value=1.0,
+            grid_sell_center = st.number_input(
+                "📈 卖出价格", 
+                value=94000.0,
+                min_value=10000.0,
+                max_value=200000.0,
                 step=1000.0,
-                key="grid_sell_low",
-                help="卖出区间的最低价格"
+                key="grid_sell_center",
+                help="AI会在此价格上下浮动生成卖出区间"
             )
-            grid_sell_high = st.number_input(
-                "区间上限", 
-                value=95000.0,
-                min_value=1.0,
-                step=1000.0,
-                key="grid_sell_high",
-                help="卖出区间的最高价格"
-            )
+        
+        # 内部自动生成区间范围（±15%浮动）
+        buy_range_pct = 0.15  # 买入区间浮动比例 ±15%
+        sell_range_pct = 0.04  # 卖出区间浮动比例 ±4%
+        
+        grid_buy_low = grid_buy_center * (1 - buy_range_pct)
+        grid_buy_high = grid_buy_center * (1 + buy_range_pct)
+        grid_sell_low = grid_sell_center * (1 - sell_range_pct)
+        grid_sell_high = grid_sell_center * (1 + sell_range_pct)
+        
+        # 显示生成的区间范围
+        st.caption(f"💡 生成买入区间: ${grid_buy_low:,.0f} - ${grid_buy_high:,.0f} | 卖出区间: ${grid_sell_low:,.0f} - ${grid_sell_high:,.0f}")
         
         st.markdown("---")
         
@@ -1427,8 +1417,18 @@ with row2_col1.container(border=True):
                 min_value=0.0,
                 step=1000.0,
                 key="grid_max_liq",
-                help="优化时确保强平价不超过此值"
+                help="安全约束：优化结果的强平价必须低于此值。注意：实际强平价由持仓状态决定，通常会远低于此上限"
             )
+            st.caption("💡 这是安全约束上限，不是目标值。AI会在此约束下尽量优化其他目标（分散性、价差、盈利）")
+        
+        # 检测强平价上限是否改变，如果改变则清除旧的优化结果
+        if grid_max_liq != st.session_state.grid_saved_max_liq:
+            if st.session_state.grid_optimization_result is not None:
+                st.warning(f"⚠️ 强平价上限已从 ${st.session_state.grid_saved_max_liq:,.0f} 改为 ${grid_max_liq:,.0f}，旧的优化结果已清除，请重新运行优化")
+                st.session_state.grid_optimization_result = None
+                st.session_state.grid_best_buy_prices = None
+                st.session_state.grid_best_sell_prices = None
+            st.session_state.grid_saved_max_liq = grid_max_liq
         
         # ========== 自动计算其他参数 ==========
         # 根据区间计算预期价差
@@ -1446,18 +1446,19 @@ with row2_col1.container(border=True):
         # ========== 基于可用资金自动计算轮数和每轮金额 ==========
         if grid_available_capital >= 500000:
             auto_n_rounds = 5
-            auto_amount_per_round = grid_available_capital * 0.15
+            auto_amount_per_round = grid_available_capital * 0.20  # 提高到20%
         elif grid_available_capital >= 200000:
             auto_n_rounds = 4
-            auto_amount_per_round = grid_available_capital * 0.20
+            auto_amount_per_round = grid_available_capital * 0.25
         elif grid_available_capital >= 100000:
             auto_n_rounds = 3
-            auto_amount_per_round = grid_available_capital * 0.25
+            auto_amount_per_round = grid_available_capital * 0.30
         else:
             auto_n_rounds = 2
             auto_amount_per_round = grid_available_capital * 0.40
         
-        auto_amount_per_round = max(50000, min(200000, auto_amount_per_round))
+        # 设置更合理的上下限（不再固定200,000）
+        auto_amount_per_round = max(50000, min(grid_available_capital * 0.5, auto_amount_per_round))
         
         st.markdown("---")
         
@@ -1497,6 +1498,7 @@ with row2_col1.container(border=True):
                 # 保存参数到session state
                 st.session_state.grid_saved_amount_per_round = auto_amount_per_round
                 st.session_state.grid_saved_n_rounds = auto_n_rounds
+                st.session_state.grid_saved_max_liq = grid_max_liq  # 保存强平价上限
                 
                 # 创建配置（使用自动计算的参数）
                 config = GridConfig(
@@ -1557,8 +1559,17 @@ with row2_col1.container(border=True):
             metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
             metric_col1.metric("总实现盈利", f"${result['total_realized_pnl']:,.0f}")
             metric_col2.metric("均价降低", f"${result['entry_reduction']:,.0f}")
-            metric_col3.metric("最大强平价", f"${result['max_liq_price']:,.0f}", 
-                              delta="✅ 安全" if result['all_safe'] else "❌ 超限")
+            
+            # 计算安全边际
+            safety_margin = grid_max_liq - result['max_liq_price']
+            safety_margin_pct = (safety_margin / grid_max_liq * 100) if grid_max_liq > 0 else 0
+            
+            metric_col3.metric(
+                "最大强平价", 
+                f"${result['max_liq_price']:,.0f}", 
+                delta=f"安全边际 ${safety_margin:,.0f} ({safety_margin_pct:.1f}%)" if result['all_safe'] else "❌ 超限",
+                delta_color="normal" if result['all_safe'] else "inverse"
+            )
             metric_col4.metric("目标价盈利", f"${result['profit_at_target']:,.0f}")
             
             st.markdown("---")
@@ -1572,63 +1583,17 @@ with row2_col1.container(border=True):
                 for i in range(len(best_buy)):
                     spread = best_sell[i] - best_buy[i]
                     spread_pct = (spread / best_buy[i]) * 100
-                    # 使用保存的价差目标进行判断
-                    in_target = grid_min_spread <= spread_pct <= grid_max_spread
                     
                     pairing_data.append({
                         '轮次': f'第{i+1}轮',
                         '买入价': f'${best_buy[i]:,.0f}',
                         '卖出价': f'${best_sell[i]:,.0f}',
                         '价差': f'${spread:,.0f}',
-                        '价差%': f'{spread_pct:.2f}%',
-                        '状态': '✅ 达标' if in_target else '⚠️ 偏离'
+                        '价差%': f'{spread_pct:.2f}%'
                     })
                 
                 pairing_df = pd.DataFrame(pairing_data)
                 st.dataframe(pairing_df, hide_index=True)
-            
-            with st.expander("📈 分散度分析"):
-                analysis_col1, analysis_col2 = st.columns(2)
-                
-                with analysis_col1:
-                    st.metric("买入均匀度", f"{result['buy_uniformity']:.2f}", 
-                             help="1.0 = 完美均匀分布")
-                    st.metric("买入最小间距", f"${result['min_buy_gap']:,.0f}",
-                             delta="✅ 达标" if result['min_buy_gap'] >= grid_min_gap else "⚠️ 不足")
-                
-                with analysis_col2:
-                    st.metric("卖出均匀度", f"{result['sell_uniformity']:.2f}",
-                             help="1.0 = 完美均匀分布")
-                    st.metric("卖出最小间距", f"${result['min_sell_gap']:,.0f}",
-                             delta="✅ 达标" if result['min_sell_gap'] >= grid_min_gap else "⚠️ 不足")
-                
-                st.metric("平均价差", f"{result['avg_spread_pct']*100:.1f}%")
-                st.metric("价差达标率", f"{result['spread_ok_count']}/{len(best_buy)}",
-                         help=f"价差在{grid_min_spread:.0f}%-{grid_max_spread:.0f}%范围内的轮数")
-            
-            with st.expander("💰 执行详情"):
-                st.markdown("**每步操作后的状态**")
-                
-                # 创建执行详情表格
-                exec_data = []
-                for i, op in enumerate(result['operations']):
-                    if op.get('type') == 'skip':
-                        continue
-                    
-                    action = "🟢 买入" if op['type'] == 'buy' else "🔴 卖出"
-                    exec_data.append({
-                        '步骤': f'步骤{i+1}',
-                        '操作': action,
-                        '价格': f"${op['price']:,.0f}",
-                        '数量': f"{abs(op['qty_change']):.4f} BTC",
-                        '持仓均价': f"${op['entry_after']:,.2f}",
-                        '强平价': f"${op['liq_price']:,.2f}",
-                        '可用余额': f"${op['available_balance']:,.0f}",
-                        '状态': '✅' if op['liq_ok'] else '❌'
-                    })
-                
-                exec_df = pd.DataFrame(exec_data)
-                st.dataframe(exec_df, hide_index=True)
             
             st.markdown("---")
             
@@ -1913,18 +1878,18 @@ with row2_col1.container(border=True):
                     # 未来版本：需要实现持仓管理和盈亏结算
 
                 
-                # 计算强平价 - Excel formula: 基于净持仓（D列，不是浮动持仓E列）
+                # 计算强平价 - Excel formula: 基于净持仓（D列）
                 if platform == 'binance':
-                    # 强平价 = 均价 - (初始权益 / 净持仓) * 均价
+                    # 强平价 = 均价 - (初始权益 / 净持仓) × 均价
                     if net_position > 0:
                         sim_liq = sim_entry - (initial_equity_for_liq / net_position) * sim_entry
-                        sim_liq = max(0.0, sim_liq)  # ⚠️ 强平价不能为负数
+                        sim_liq = max(0.0, sim_liq)  # 强平价不能为负数
                     else:
                         sim_liq = 0
                 elif platform == 'coin_margined':
                     # 币本位使用预先计算的强平价
                     sim_liq = op.get('liq_price', 0)
-                    sim_liq = max(0.0, sim_liq)  # ⚠️ 强平价不能为负数
+                    sim_liq = max(0.0, sim_liq)
                 else:
                     sim_liq = None  # Binance 现货无强平价
                 
@@ -2200,7 +2165,22 @@ with row2_col2.container(border=True):
             st.info(f"⚙️ 考虑第2板块的 {len(st.session_state.operations)} 个操作")
         else:
             st.info("💡 未设置操作序列，结果与情景A相同")
-        st.metric("剩余资金(止盈)", f"${adjusted_equity_final:,.0f}")
+        
+        # 显示剩余资金(止盈) - 添加详细说明
+        st.metric(
+            "剩余资金(止盈)", 
+            f"${adjusted_equity_final:,.0f}",
+            help="平仓后的总资金 = 可用资金 + 浮盈 + 保证金释放"
+        )
+        
+        # 显示分解明细
+        if len(st.session_state.operations) > 0:
+            with st.expander("💡 计算明细"):
+                st.caption(f"**可用资金**: ${seq_equity:,.0f}")
+                st.caption(f"**持仓浮盈**: ${floating_pnl:,.0f}")
+                st.caption(f"**保证金释放**: ${final_margin:,.0f}")
+                st.caption(f"**合计**: ${adjusted_equity_final:,.0f}")
+        
         # 显示纯浮盈（剩余持仓的未实现盈亏），而不是总盈利
         st.metric("浮盈", f"${floating_pnl:,.0f}", 
                   delta=f"vs 现在",
@@ -2272,14 +2252,14 @@ with st.container(border=True):
     x_adjusted_prices.append(key_prices[-1])
     x_adjusted_prices = np.array(x_adjusted_prices)
     
-    # 模拟执行过程 - 使用Excel公式（与Binance一致）
+    # 模拟执行过程 - 使用Excel公式保持一致性
     sim_qty = long_qty
     sim_entry = long_entry
     cumulative_realized_pnl = 0  # 累计已实现盈亏
     op_index = 0
     
-    # Excel formula tracking variables - 与操作列表保持一致
-    prev_price_chart = long_entry if long_qty > 0 else current_price
+    # Excel formula tracking variables (与操作列表一致)
+    prev_price_chart = long_entry if long_qty > 0 else 0
     net_position_chart = long_qty * long_entry if long_qty > 0 else 0
     floating_position_chart = net_position_chart
     
@@ -2298,18 +2278,12 @@ with st.container(border=True):
                 else:
                     sell_qty = min(op['amount'] / sim_entry, sim_qty) if sim_entry > 0 else 0
                 
-                # ⚠️ 支持AI配对操作（与操作列表和calculate_operation_sequence一致）
-                paired_buy_price = op.get('paired_buy_price', None)
-                if paired_buy_price is not None:
-                    # AI配对操作：盈亏 = 卖出数量 × (卖出价 - 买入价)
-                    realized_pnl = sell_qty * (op_price - paired_buy_price)
-                else:
-                    # 普通操作：使用持仓均价
-                    realized_pnl = sell_qty * (op_price - sim_entry)
+                # 计算该笔卖出的实现盈亏
+                realized_pnl = sell_qty * (op_price - sim_entry)
                 cumulative_realized_pnl += realized_pnl
                 sim_qty -= sell_qty
                 
-                # ⚠️ Excel公式：卖出后更新 net_position 和 floating_position
+                # Excel: 卖出后按比例减少净持仓和浮动持仓
                 sell_ratio = sell_qty / (sim_qty + sell_qty) if (sim_qty + sell_qty) > 0 else 0
                 net_position_chart = net_position_chart * (1 - sell_ratio)
                 floating_position_chart = floating_position_chart * (1 - sell_ratio)
@@ -2338,23 +2312,23 @@ with st.container(border=True):
                 buy_qty = buy_value / op_price if op_price > 0 else 0
                 effective_usdt = buy_value
                 
-                # ⚠️ Excel formula: 保存前一个均价
+                # Excel formula: 保存前一个均价
                 prev_avg_chart = sim_entry
                 
-                # ⚠️ Excel formula: Net Position (D列)
+                # Excel formula: Net Position
                 prev_net_chart = net_position_chart
                 net_position_chart += effective_usdt
                 
-                # ⚠️ Excel formula: Floating Position (E列) - 价格方向判断
+                # Excel formula: Floating Position - 价格方向判断
                 if prev_net_chart > 0:
                     if op_price < prev_price_chart:  # 价格下跌
                         floating_position_chart = effective_usdt + prev_net_chart - (prev_avg_chart - op_price) * prev_net_chart / prev_avg_chart
-                    else:  # 价格上涨
+                    else:  # 价格上涨或持平
                         floating_position_chart = effective_usdt + prev_net_chart + (prev_avg_chart - op_price) * prev_net_chart / prev_avg_chart
                 else:
                     floating_position_chart = effective_usdt
                 
-                # ⚠️ Excel formula: Average Price (F列) - 基于浮动持仓
+                # Excel formula: Average Price
                 if floating_position_chart > 0:
                     sim_entry = ((op_price * effective_usdt) + prev_avg_chart * (floating_position_chart - effective_usdt)) / floating_position_chart
                 
