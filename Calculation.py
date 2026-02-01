@@ -292,7 +292,8 @@ class GridConfig:
     
     # 操作参数
     n_rounds: int = 3
-    amount_per_round: float = 100_000
+    min_amount_per_round: float = 50_000      # 每轮最小金额
+    max_amount_per_round: float = 500_000     # 每轮最大金额（将根据可用资金动态设置）
     
     # 算法参数
     population_size: int = 500
@@ -303,22 +304,30 @@ def generate_paired_prices(
     buy_zone_low: float, buy_zone_high: float,
     sell_zone_low: float, sell_zone_high: float,
     min_spread: float, max_spread: float,
-    n_rounds: int, rng
-) -> Tuple[List[float], List[float]]:
+    n_rounds: int,
+    min_amount: float,
+    max_amount: float,
+    total_capital: float,
+    rng
+) -> Tuple[List[float], List[float], List[float]]:
     """
-    生成配对的买卖价格
+    生成配对的买卖价格和金额
     
     确保：
     1. 买入价在买入区间内均匀分布
     2. 卖出价在卖出区间内均匀分布
     3. 买卖价格独立分散（不再强制基于价差计算）
+    4. 金额在min到max之间随机分配
+    5. 总金额在total_capital的80%-100%之间
     """
     buy_segment = (buy_zone_high - buy_zone_low) / n_rounds
     sell_segment = (sell_zone_high - sell_zone_low) / n_rounds
     
     buy_prices = []
     sell_prices = []
+    amounts = []
     
+    # 生成初始金额（随机分配）
     for i in range(n_rounds):
         # 买入价：在第i段内随机选择
         buy_seg_low = buy_zone_low + i * buy_segment
@@ -330,33 +339,50 @@ def generate_paired_prices(
         sell_seg_high = sell_zone_low + (i + 1) * sell_segment
         sell_price = rng.uniform(sell_seg_low, sell_seg_high)
         
+        # 金额：在min到max之间随机
+        amount = rng.uniform(min_amount, max_amount)
+        
         buy_prices.append(buy_price)
         sell_prices.append(sell_price)
+        amounts.append(amount)
     
-    return buy_prices, sell_prices
+    # 归一化金额，使总和在80%-100%的total_capital之间
+    total_amount = sum(amounts)
+    target_total = rng.uniform(total_capital * 0.80, total_capital * 1.00)
+    scale_factor = target_total / total_amount if total_amount > 0 else 1.0
+    
+    amounts = [amt * scale_factor for amt in amounts]
+    
+    # 确保每个金额仍在合理范围内
+    amounts = [max(min_amount, min(max_amount, amt)) for amt in amounts]
+    
+    return buy_prices, sell_prices, amounts
 
 
 def simulate_grid_strategy(
     buy_prices: List[float],
     sell_prices: List[float],
+    amounts: List[float],
     config: GridConfig
 ) -> Dict:
     """
     模拟网格策略执行
     
-    强平价公式：Liq_Price = Entry_Price - Total_Equity / Position_Qty
+    强平价公式（Binance全仓合约）：
+    Liq = Entry - (initial_equity / net_position) × Entry
+    其中 net_position = qty × entry
     
-    - 买入时：仓位增加，需要新增保证金，总权益增加
+    - 买入时：仓位增加，均价更新
     - 卖出时：仓位减少，释放保证金 + 实现盈亏
     """
     # 初始状态
     qty = config.current_qty
     entry = config.entry_price
     
-    # 从当前强平价推算初始总权益
-    # Liq = Entry - Equity/Qty => Equity = (Entry - Liq) * Qty
+    # 计算初始权益（用于强平价计算，保持固定）
+    # 反推公式：Liq = Entry - (Equity / (Qty × Entry)) × Entry
+    #          => Equity = (Entry - Liq) × Qty
     initial_equity = (config.entry_price - config.current_liq_price) * config.current_qty
-    total_equity = initial_equity
     available_balance = config.available_capital
     
     operations = []
@@ -368,7 +394,7 @@ def simulate_grid_strategy(
     for round_idx in range(config.n_rounds):
         buy_price = buy_prices[round_idx]
         sell_price = sell_prices[round_idx]
-        buy_amount = config.amount_per_round
+        buy_amount = amounts[round_idx]  # 使用灵活金额而非固定值
         
         # 计算价差
         spread = sell_price - buy_price
@@ -403,12 +429,18 @@ def simulate_grid_strategy(
         # 更新入场均价（加权平均）
         entry = (old_entry * old_qty + buy_price * qty_bought) / qty
         
-        # 更新总权益（增加使用的保证金）
-        total_equity += margin_needed
+        # ⚠️ 修复：不再累加total_equity（这是错误的）
+        # total_equity += margin_needed
+        available_balance -= margin_needed
         
-        # 计算强平价: Liq = Entry - Equity / Qty
-        liq_price = entry - total_equity / qty
-        liq_price = max(0, liq_price)
+        # 计算强平价 - Binance全仓合约正确公式
+        # Liq = Entry - (initial_equity / net_position) × Entry
+        net_position = qty * entry  # 净持仓价值
+        if net_position > 0:
+            liq_price = entry - (initial_equity / net_position) * entry
+            liq_price = max(0, liq_price)
+        else:
+            liq_price = 0
         all_liq_prices.append(liq_price)
         
         buy_ok = liq_price < config.max_liq_price
@@ -423,7 +455,6 @@ def simulate_grid_strategy(
             'entry_after': entry,
             'liq_price': liq_price,
             'available_balance': available_balance,
-            'total_equity': total_equity,
             'liq_ok': buy_ok
         })
         
@@ -436,16 +467,17 @@ def simulate_grid_strategy(
         # 更新持仓
         qty -= sell_qty
         
-        # 卖出时：总权益增加实现盈亏
-        total_equity += realized_pnl
+        # ⚠️ 修复：不再更新total_equity
+        # total_equity += realized_pnl
         
-        # 释放的保证金回到可用余额
+        # 释放的保证金和盈亏回到可用余额
         margin_released = margin_needed  # 简化：释放的就是之前用的
         available_balance += margin_released + realized_pnl
         
-        # 计算强平价
+        # 计算强平价 - Binance全仓合约正确公式
         if qty > 0:
-            liq_price = entry - total_equity / qty
+            net_position = qty * entry
+            liq_price = entry - (initial_equity / net_position) * entry
             liq_price = max(0, liq_price)
         else:
             liq_price = 0
@@ -465,7 +497,6 @@ def simulate_grid_strategy(
             'realized_pnl': realized_pnl,
             'liq_price': liq_price,
             'available_balance': available_balance,
-            'total_equity': total_equity,
             'liq_ok': liq_price < config.max_liq_price
         })
     
@@ -507,6 +538,7 @@ def simulate_grid_strategy(
     # 计算最大强平价
     max_liq_price = max(all_liq_prices)
     
+    
     return {
         'final_qty': qty,
         'final_entry': entry,
@@ -515,7 +547,6 @@ def simulate_grid_strategy(
         'final_liq_price': liq_price,
         'total_realized_pnl': total_realized_pnl,
         'final_available_balance': available_balance,
-        'final_total_equity': total_equity,
         'profit_at_target': profit_at_target,
         'operations': operations,
         'spreads': spreads,
@@ -532,21 +563,25 @@ def simulate_grid_strategy(
 def evaluate_solution(
     buy_prices: List[float],
     sell_prices: List[float],
+    amounts: List[float],
     config: GridConfig
 ) -> Tuple[float, Dict]:
     """
     评估方案
     
     权重分配：
-    - 安全性（强平价）：40% - 硬约束（在上限内=满分，超限=0分）
-    - 分散性（间距+均匀）：30%
+    - 安全性（强平价）：40% - 梯度评分，奖励接近上限的强平价
+    - 分散性（间距+均匀）：25%
     - 价差合理性：20%
+    - 金额分配合理性：5%
     - 盈利：10%
     
-    注意：安全性采用二元评分，不再奖励"过度安全"，
-    这样AI可以生成接近强平价上限的方案
+    安全性评分：safety_score = max_liq / max_liq_price
+    例如：强平价$50k/上限$60k = 0.833分
+         强平价$30k/上限$60k = 0.5分
+    这样AI会追求更高的强平价，而不是过度保守
     """
-    result = simulate_grid_strategy(buy_prices, sell_prices, config)
+    result = simulate_grid_strategy(buy_prices, sell_prices, amounts, config)
     
     # 1. 间距得分（相邻价格必须 >= min_price_gap）
     gap_ok = (result['min_buy_gap'] >= config.min_price_gap and 
@@ -564,24 +599,57 @@ def evaluate_solution(
     else:
         spread_score = spread_ratio * 0.5
     
-    # 4. 安全性得分（强平价约束 - 权重提高至40%）
-    # 修改：只要在上限内就给满分，不再奖励"过度安全"
-    # 这样AI可以生成接近上限的方案，而不是总是追求极低的强平价
+    # 4. 安全性得分（强平价约束 - 权重40%）
+    # 修改：梯度评分，奖励接近上限的强平价
+    # 这样AI会追求接近max_liq_price的强平价，而不是过度保守
     if not result['all_safe']:
         safety_score = 0  # 超限直接0分
     else:
-        safety_score = 1.0  # 在上限内直接满分
+        # 梯度评分：强平价越接近上限，得分越高
+        # safety_score = current_liq / max_liq
+        # 例如：liq=$50k, max=$60k => score=0.833
+        #      liq=$30k, max=$60k => score=0.5
+        max_liq = result['max_liq_price']
+        if config.max_liq_price > 0:
+            safety_score = min(1.0, max_liq / config.max_liq_price)
+        else:
+            safety_score = 1.0
     
     # 5. 盈利得分
     profit_score = min(1.0, result['total_realized_pnl'] / 25000)
     
-    # 加权（安全性优先）
+    # 6. 金额分配合理性得分
+    total_amount_used = sum(amounts)
+    # 检查资金利用率（期望80%-100%）
+    capital_usage = total_amount_used / config.available_capital if config.available_capital > 0 else 0
+    if 0.80 <= capital_usage <= 1.00:
+        usage_score = 1.0
+    elif capital_usage < 0.80:
+        usage_score = capital_usage / 0.80  # 低于80%线性降分
+    else:
+        usage_score = max(0, 2.0 - capital_usage)  # 超过100%惩罚
+    
+    # 检查金额分布合理性（避免所有金额集中在一轮）
+    if len(amounts) > 0:
+        amount_variance = np.std(amounts) / np.mean(amounts) if np.mean(amounts) > 0 else 0
+        # 方差系数在0.3-0.5之间最佳
+        if 0.2 <= amount_variance <= 0.6:
+            variance_score = 1.0
+        else:
+            variance_score = max(0.5, 1.0 - abs(amount_variance - 0.4) * 2)
+    else:
+        variance_score = 0.5
+    
+    amount_score = (usage_score * 0.7 + variance_score * 0.3)
+    
+    # 加权（重新分配权重）
     total_score = (
-        gap_score * 0.15 +
-        uniformity_score * 0.15 +
-        spread_score * 0.20 +
-        safety_score * 0.40 +
-        profit_score * 0.10
+        gap_score * 0.125 +          # 间距 12.5%
+        uniformity_score * 0.125 +    # 均匀性 12.5%
+        spread_score * 0.20 +         # 价差 20%
+        safety_score * 0.40 +         # 安全性 40%
+        amount_score * 0.05 +         # 金额分配 5%
+        profit_score * 0.10           # 盈利 10%
     )
     
     # 硬约束惩罚
@@ -609,26 +677,30 @@ def optimize_grid_silent(config: GridConfig, progress_callback=None) -> Tuple[Li
     # 初始化种群
     population = []
     for _ in range(config.population_size):
-        buy_prices, sell_prices = generate_paired_prices(
+        buy_prices, sell_prices, amounts = generate_paired_prices(
             config.buy_zone_low, config.buy_zone_high,
             config.sell_zone_low, config.sell_zone_high,
             config.min_spread_pct, config.max_spread_pct,
-            config.n_rounds, rng
+            config.n_rounds,
+            config.min_amount_per_round,
+            config.max_amount_per_round,
+            config.available_capital,
+            rng
         )
-        score, result = evaluate_solution(buy_prices, sell_prices, config)
-        population.append((buy_prices, sell_prices, score, result))
+        score, result = evaluate_solution(buy_prices, sell_prices, amounts, config)
+        population.append((buy_prices, sell_prices, amounts, score, result))
     
     best_solution = None
     best_score = float('-inf')
     best_result = None
     
     for gen in range(config.n_generations):
-        population.sort(key=lambda x: x[2], reverse=True)
+        population.sort(key=lambda x: x[3], reverse=True)
         
-        if population[0][2] > best_score:
-            best_solution = (population[0][0].copy(), population[0][1].copy())
-            best_score = population[0][2]
-            best_result = population[0][3]
+        if population[0][3] > best_score:
+            best_solution = (population[0][0].copy(), population[0][1].copy(), population[0][2].copy())
+            best_score = population[0][3]
+            best_result = population[0][4]
         
         # 调用进度回调
         if progress_callback and (gen % 10 == 0 or gen == config.n_generations - 1):
@@ -646,18 +718,21 @@ def optimize_grid_silent(config: GridConfig, progress_callback=None) -> Tuple[Li
             idx1 = rng.choice(len(population) // 4)
             idx2 = rng.choice(len(population) // 4)
             
-            # 交叉
+            # 交叉（包括价格和金额）
             child_buy = []
             child_sell = []
+            child_amounts = []
             for i in range(config.n_rounds):
                 if rng.random() < 0.5:
                     child_buy.append(population[idx1][0][i])
                     child_sell.append(population[idx1][1][i])
+                    child_amounts.append(population[idx1][2][i])
                 else:
                     child_buy.append(population[idx2][0][i])
                     child_sell.append(population[idx2][1][i])
+                    child_amounts.append(population[idx2][2][i])
             
-            # 变异
+            # 变异（价格和金额）
             if rng.random() < 0.4:
                 idx = rng.integers(config.n_rounds)
                 # 小范围调整买入价
@@ -670,21 +745,34 @@ def optimize_grid_silent(config: GridConfig, progress_callback=None) -> Tuple[Li
                 child_sell[idx] = np.clip(child_sell[idx],
                                           config.sell_zone_low, config.sell_zone_high)
             
+            # 金额变异
+            if rng.random() < 0.3:
+                idx = rng.integers(config.n_rounds)
+                # 调整金额（±30%）
+                delta_pct = rng.uniform(-0.3, 0.3)
+                child_amounts[idx] = np.clip(child_amounts[idx] * (1 + delta_pct),
+                                            config.min_amount_per_round,
+                                            config.max_amount_per_round)
+            
             # 偶尔重新生成
             if rng.random() < 0.05:
-                child_buy, child_sell = generate_paired_prices(
+                child_buy, child_sell, child_amounts = generate_paired_prices(
                     config.buy_zone_low, config.buy_zone_high,
                     config.sell_zone_low, config.sell_zone_high,
                     config.min_spread_pct, config.max_spread_pct,
-                    config.n_rounds, rng
+                    config.n_rounds,
+                    config.min_amount_per_round,
+                    config.max_amount_per_round,
+                    config.available_capital,
+                    rng
                 )
             
-            score, result = evaluate_solution(child_buy, child_sell, config)
-            new_population.append((child_buy, child_sell, score, result))
+            score, result = evaluate_solution(child_buy, child_sell, child_amounts, config)
+            new_population.append((child_buy, child_sell, child_amounts, score, result))
         
         population = new_population
     
-    return best_solution[0], best_solution[1], best_result
+    return best_solution[0], best_solution[1], best_solution[2], best_result
 
 
 # 强平价计算将在数据编辑器之后进行，使用更新后的持仓数据
@@ -1337,9 +1425,9 @@ with row2_col1.container(border=True):
             st.session_state.grid_best_buy_prices = None
         if 'grid_best_sell_prices' not in st.session_state:
             st.session_state.grid_best_sell_prices = None
+        if 'grid_best_amounts' not in st.session_state:
+            st.session_state.grid_best_amounts = None
         # 保存优化时使用的参数（避免rerun后丢失）
-        if 'grid_saved_amount_per_round' not in st.session_state:
-            st.session_state.grid_saved_amount_per_round = 100000.0
         if 'grid_saved_n_rounds' not in st.session_state:
             st.session_state.grid_saved_n_rounds = 3
         # 追踪上次优化时使用的强平价上限
@@ -1428,6 +1516,7 @@ with row2_col1.container(border=True):
                 st.session_state.grid_optimization_result = None
                 st.session_state.grid_best_buy_prices = None
                 st.session_state.grid_best_sell_prices = None
+                st.session_state.grid_best_amounts = None
             st.session_state.grid_saved_max_liq = grid_max_liq
         
         # ========== 自动计算其他参数 ==========
@@ -1435,30 +1524,36 @@ with row2_col1.container(border=True):
         min_possible_spread = (grid_sell_low - grid_buy_high) / grid_buy_high if grid_buy_high > 0 else 0.03
         max_possible_spread = (grid_sell_high - grid_buy_low) / grid_buy_low if grid_buy_low > 0 else 0.15
         
+        # 确保min_possible_spread不是负数
+        min_possible_spread = max(0.01, min_possible_spread)
+        
         # 设置合理的价差目标范围
         grid_min_spread = max(0.03, min_possible_spread * 0.9)
         grid_max_spread = min(0.20, max_possible_spread * 1.1)
+        
+        # 确保max >= min（关键修复）
+        if grid_max_spread < grid_min_spread:
+            # 如果区间重叠，使用保守的固定价差
+            grid_min_spread = 0.03
+            grid_max_spread = 0.08
         
         # 自动计算最小间距（基于买入区间大小）
         buy_range = grid_buy_high - grid_buy_low
         grid_min_gap = max(500, buy_range / 8)
         
-        # ========== 基于可用资金自动计算轮数和每轮金额 ==========
+        # ========== 基于可用资金自动计算轮数和每轮金额范围 ==========
         if grid_available_capital >= 500000:
             auto_n_rounds = 5
-            auto_amount_per_round = grid_available_capital * 0.20  # 提高到20%
         elif grid_available_capital >= 200000:
             auto_n_rounds = 4
-            auto_amount_per_round = grid_available_capital * 0.25
         elif grid_available_capital >= 100000:
             auto_n_rounds = 3
-            auto_amount_per_round = grid_available_capital * 0.30
         else:
             auto_n_rounds = 2
-            auto_amount_per_round = grid_available_capital * 0.40
         
-        # 设置更合理的上下限（不再固定200,000）
-        auto_amount_per_round = max(50000, min(grid_available_capital * 0.5, auto_amount_per_round))
+        # 设置灵活金额范围
+        auto_min_amount = max(50000, grid_available_capital * 0.10)  # 最小10%
+        auto_max_amount = min(grid_available_capital * 0.50, 800000)  # 最大50%或800k
         
         st.markdown("---")
         
@@ -1486,7 +1581,7 @@ with row2_col1.container(border=True):
                 st.warning(f"⚠️ {warning}")
         
         # 显示AI自动计算的参数
-        st.info(f"🤖 AI将自动优化：**{auto_n_rounds}轮** 操作，每轮约 **${auto_amount_per_round:,.0f}**，目标价差 **{grid_min_spread*100:.1f}%-{grid_max_spread*100:.1f}%**")
+        st.info(f"🤖 AI将自动优化：**{auto_n_rounds}轮** 操作，每轮约 **${auto_min_amount:,.0f} - ${auto_max_amount:,.0f}**（灵活分配），目标价差 **{grid_min_spread*100:.1f}%-{grid_max_spread*100:.1f}%**")
         
         # 优化按钮
         col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 1])
@@ -1496,7 +1591,6 @@ with row2_col1.container(border=True):
             
             if st.button("🚀 开始AI优化", type="primary", disabled=not can_optimize):
                 # 保存参数到session state
-                st.session_state.grid_saved_amount_per_round = auto_amount_per_round
                 st.session_state.grid_saved_n_rounds = auto_n_rounds
                 st.session_state.grid_saved_max_liq = grid_max_liq  # 保存强平价上限
                 
@@ -1517,7 +1611,8 @@ with row2_col1.container(border=True):
                     leverage=10,
                     target_btc_price=grid_target_price,
                     n_rounds=auto_n_rounds,
-                    amount_per_round=auto_amount_per_round,
+                    min_amount_per_round=auto_min_amount,
+                    max_amount_per_round=auto_max_amount,
                     population_size=200,
                     n_generations=100
                 )
@@ -1533,12 +1628,14 @@ with row2_col1.container(border=True):
                 
                 # 执行优化
                 with st.spinner("AI正在计算最优策略..."):
-                    best_buy, best_sell, best_result = optimize_grid_silent(config, progress_callback)
+                    # 运行优化
+                    best_buy, best_sell, best_amounts, best_result = optimize_grid_silent(config, progress_callback)
                     
-                    # 保存结果到session state
+                    # 保存结果
                     st.session_state.grid_optimization_result = best_result
                     st.session_state.grid_best_buy_prices = best_buy
                     st.session_state.grid_best_sell_prices = best_sell
+                    st.session_state.grid_best_amounts = best_amounts  # 保存amounts
                 
                 progress_bar.progress(1.0)
                 status_text.text("✅ 优化完成！")
@@ -1550,7 +1647,7 @@ with row2_col1.container(border=True):
             result = st.session_state.grid_optimization_result
             best_buy = st.session_state.grid_best_buy_prices
             best_sell = st.session_state.grid_best_sell_prices
-            saved_amount = st.session_state.grid_saved_amount_per_round
+            best_amounts = st.session_state.grid_best_amounts
             
             st.markdown("---")
             st.markdown("#### 📊 优化结果")
@@ -1588,6 +1685,7 @@ with row2_col1.container(border=True):
                         '轮次': f'第{i+1}轮',
                         '买入价': f'${best_buy[i]:,.0f}',
                         '卖出价': f'${best_sell[i]:,.0f}',
+                        '金额': f'${best_amounts[i]:,.0f}',
                         '价差': f'${spread:,.0f}',
                         '价差%': f'{spread_pct:.2f}%'
                     })
@@ -1605,18 +1703,19 @@ with row2_col1.container(border=True):
                     st.session_state.grid_optimization_result = None
                     st.session_state.grid_best_buy_prices = None
                     st.session_state.grid_best_sell_prices = None
+                    st.session_state.grid_best_amounts = None
                     st.rerun()
             
             with apply_col3:
                 if st.button("✅ 应用到操作列表", type="primary"):
-                    # 将优化结果转换为操作序列并添加（使用保存的参数）
+                    # 将优化结果转换为操作序列并添加（使用灵活金额）
                     for i in range(len(best_buy)):
                         # 添加买入操作
                         buy_op = {
                             'price': best_buy[i],
                             'action': '买入',
                             'amount_type': 'USDT金额',
-                            'amount': saved_amount,  # 使用session state保存的值
+                            'amount': best_amounts[i],  # 使用灵活金额
                             'platform': 'binance',
                             'leverage': 10
                         }
@@ -1627,7 +1726,7 @@ with row2_col1.container(border=True):
                             'price': best_sell[i],
                             'action': '卖出',
                             'amount_type': 'USDT金额',
-                            'amount': saved_amount,  # 使用session state保存的值
+                            'amount': best_amounts[i],  # 使用相同金额
                             'platform': 'binance',
                             'leverage': 10,
                             'paired_buy_price': best_buy[i]  # 记录配对的买入价用于盈亏计算
@@ -1638,6 +1737,7 @@ with row2_col1.container(border=True):
                     st.session_state.grid_optimization_result = None
                     st.session_state.grid_best_buy_prices = None
                     st.session_state.grid_best_sell_prices = None
+                    st.session_state.grid_best_amounts = None
                     
                     st.success(f"✅ 已添加 {len(best_buy) * 2} 个操作到操作列表")
                     st.rerun()
@@ -1652,6 +1752,39 @@ with row2_col1.container(border=True):
     if len(st.session_state.operations) == 0:
         st.info("暂无操作。点击上方「➕ 添加」按钮添加操作。")
     else:
+        # 添加排序按钮
+        sort_col1, sort_col2, sort_col3 = st.columns([1.2, 1.5, 3.3])
+        
+        with sort_col1:
+            if st.button("🔄 按价格排序", help="先执行所有买入（价格从高到低），再执行所有卖出（价格从低到高）"):
+                # 保存原始顺序（如果还没保存）
+                if 'operations_original_order' not in st.session_state:
+                    st.session_state.operations_original_order = st.session_state.operations.copy()
+                
+                # 分离买入和卖出
+                buys = [op for op in st.session_state.operations if op['action'] == '买入']
+                sells = [op for op in st.session_state.operations if op['action'] == '卖出']
+                
+                # 按价格排序
+                buys.sort(key=lambda x: x['price'], reverse=True)  # 买入：从高到低
+                sells.sort(key=lambda x: x['price'])  # 卖出：从低到高
+                
+                # 合并：先买后卖
+                st.session_state.operations = buys + sells
+                st.rerun()
+        
+        with sort_col2:
+            if st.button("↩️ 恢复默认顺序", help="恢复到添加操作时的原始顺序"):
+                if 'operations_original_order' in st.session_state:
+                    st.session_state.operations = st.session_state.operations_original_order.copy()
+                    st.rerun()
+                else:
+                    st.warning("没有保存的原始顺序")
+        
+        with sort_col3:
+            st.caption(f"共 {len(st.session_state.operations)} 个操作")
+        
+
         # 计算整个操作序列的执行结果（用于显示）
         sim_binance_equity = st.session_state.binance_equity
         
